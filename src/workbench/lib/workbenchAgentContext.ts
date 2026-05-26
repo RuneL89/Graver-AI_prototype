@@ -116,6 +116,8 @@ export function createWorkbenchContextBuilder(
   workbenchConfig: WorkbenchSessionConfig,
   wikiId: string | null
 ) {
+  let capturedTipId: string | undefined;
+
   return (params: {
     sessionConfig: unknown;
     currentDraft: string;
@@ -123,6 +125,24 @@ export function createWorkbenchContextBuilder(
     segmentLoopIndex: number;
     feedback?: unknown;
   }): WorkbenchAgentContext => {
+    // Try to extract tipId from currentDraft when it contains a ResearchPlan JSON.
+    // This allows downstream agents (synthesize, assemble) to locate persisted data
+    // even when the runner passes findings JSON or audit metadata as currentDraft.
+    if (!capturedTipId && params.currentDraft) {
+      try {
+        const parsed = JSON.parse(params.currentDraft);
+        if (parsed.tipId && typeof parsed.tipId === 'string') {
+          capturedTipId = parsed.tipId;
+        }
+      } catch {
+        // Not JSON — could be raw tip text (decompose) or a tipId string.
+        // If it looks like a tipId (tip-{timestamp}), capture it directly.
+        if (/^tip-\d+$/.test(params.currentDraft)) {
+          capturedTipId = params.currentDraft;
+        }
+      }
+    }
+
     return {
       sessionConfig: params.sessionConfig as SessionConfig,
       currentDraft: params.currentDraft,
@@ -132,6 +152,7 @@ export function createWorkbenchContextBuilder(
       apiConfig: workbenchConfig.apiConfig,
       braveApiKey: workbenchConfig.braveApiKey,
       braveProxyUrl: workbenchConfig.braveProxyUrl,
+      tipId: capturedTipId,
       wikiId,
     };
   };

@@ -275,6 +275,7 @@ export class PipelineRunner<T = SessionConfig> {
         // when the pipeline has non-linear input requirements (e.g., workbench).
         if (this.useRunFromInputs) {
           const inputs = this.getRunFromInputs(next, this.state.stages);
+          console.log(`[Pipeline] useRunFromInputs for ${next}: draft length=${inputs.draft.length}, feedback=${inputs.feedback !== undefined}`);
           if (inputs.draft !== '' || inputs.feedback !== undefined) {
             draft = inputs.draft;
             feedback = inputs.feedback;

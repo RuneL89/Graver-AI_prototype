@@ -48,7 +48,7 @@ export async function synthesizeEvidence(
 
     const plan = await loadResearchPlan(tipId);
     if (!plan) {
-      throw new Error('Research plan not found');
+      throw new Error(`Research plan not found for tipId: ${tipId}`);
     }
 
     const { external, internal } = await loadEvidence(tipId);
@@ -142,14 +142,14 @@ export async function synthesizeEvidenceAgent(
   onUpdate?: (partial: Partial<StageRecord>) => void
 ): Promise<AgentOutput> {
   checkAborted(ctx);
-  const tipId = ctx.currentDraft;
+  const tipId = ctx.tipId || ctx.currentDraft;
   const apiConfig = ctx.apiConfig;
 
   emitReasoning('[Synthesizer] Loading evidence...', onReasoningChunk, onUpdate);
 
   const plan = await loadResearchPlan(tipId);
   if (!plan) {
-    throw new Error('Research plan not found');
+    throw new Error(`Research plan not found for tipId: ${tipId}`);
   }
 
   const { external, internal } = await loadEvidence(tipId);

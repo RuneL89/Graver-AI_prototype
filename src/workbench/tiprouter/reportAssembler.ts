@@ -173,7 +173,7 @@ export async function assembleEvidenceMemo(tipId: string): Promise<AssembleResul
   try {
     const plan = await loadPlan(tipId);
     if (!plan) {
-      return { success: false, error: 'Research plan not found' };
+      return { success: false, error: `Research plan not found for tipId: ${tipId}` };
     }
 
     const synthesis = await loadSynthesis(tipId);
@@ -219,13 +219,13 @@ export async function assembleEvidenceMemoAgent(
   onUpdate?: (partial: Partial<StageRecord>) => void
 ): Promise<AgentOutput> {
   checkAborted(ctx);
-  const tipId = ctx.currentDraft;
+  const tipId = ctx.tipId || ctx.currentDraft;
 
   emitReasoning('[ReportAssembler] Assembling evidence memo...', onReasoningChunk, onUpdate);
 
   const plan = await loadPlan(tipId);
   if (!plan) {
-    throw new Error('Research plan not found');
+    throw new Error(`Research plan not found for tipId: ${tipId}`);
   }
 
   const synthesis = await loadSynthesis(tipId);
