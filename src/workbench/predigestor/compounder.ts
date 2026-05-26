@@ -9,6 +9,9 @@ import {
   readAllWikiPages,
 } from './schema';
 import schemaMarkdown from './schema.md?raw';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { checkAborted, emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
 
 export interface CompoundCallbacks {
   onReasoningChunk?: (chunk: string) => void;
@@ -92,7 +95,8 @@ async function step1SourceSummary(
   chunks: DocumentChunk[],
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: CompoundCallbacks
+  callbacks?: CompoundCallbacks,
+  signal?: AbortSignal
 ): Promise<string> {
   const safeDocName = sanitizeFilename(documentName);
   const path = `sources/${safeDocName}.md`;
@@ -115,7 +119,7 @@ async function step1SourceSummary(
     `- Note any relationships to other sources if you can infer them\n\n` +
     `Output ONLY the markdown content for the page. Do not wrap in delimiters.`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   await writeWikiPage(path, content.trim(), wikiId);
@@ -131,7 +135,8 @@ async function step2Index(
   newPages: string[],
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: CompoundCallbacks
+  callbacks?: CompoundCallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   callbacks?.onReasoningChunk?.(`[Compound] Step 2/6: Updating index.md...`);
 
@@ -153,7 +158,7 @@ async function step2Index(
     `- If sources relate to each other, note those connections\n\n` +
     `Output ONLY the markdown content for index.md.`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   await writeWikiPage('index.md', content.trim(), wikiId);
@@ -168,7 +173,8 @@ async function step3Entities(
   sourceSummary: string,
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: CompoundCallbacks
+  callbacks?: CompoundCallbacks,
+  signal?: AbortSignal
 ): Promise<string[]> {
   callbacks?.onReasoningChunk?.(`[Compound] Step 3/6: Extracting and merging entities...`);
 
@@ -191,11 +197,11 @@ async function step3Entities(
     `- Only include entities actually mentioned in the new source\n` +
     `- If an entity page already exists, MERGE new info into it; do not duplicate existing content\n` +
     `- Add cross-links to related entities, concepts, and findings using [[wikilink]] syntax\n` +
-    `- If the new source CONTRADICTS existing info, flag it with a ⚠️ marker and explain both claims\n` +
+    `- If the new source CONTRADICTS existing info, flag it with a [CONTRADICTION] marker and explain both claims\n` +
     `- If the new source STRENGTHENS existing info, note that explicitly\n` +
     `- Output ONLY the delimited file blocks; no extra commentary`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   const pages = parseFileBlocks(content);
@@ -216,7 +222,8 @@ async function step4Concepts(
   sourceSummary: string,
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: CompoundCallbacks
+  callbacks?: CompoundCallbacks,
+  signal?: AbortSignal
 ): Promise<string[]> {
   callbacks?.onReasoningChunk?.(`[Compound] Step 4/6: Extracting and merging concepts...`);
 
@@ -239,11 +246,11 @@ async function step4Concepts(
     `- Only include concepts actually relevant to the new source\n` +
     `- If a concept page already exists, MERGE new info into it; do not duplicate existing content\n` +
     `- Add cross-links to related entities and findings using [[wikilink]] syntax\n` +
-    `- If the new source CONTRADICTS existing definitions or context, flag it with a ⚠️ marker\n` +
+    `- If the new source CONTRADICTS existing definitions or context, flag it with a [CONTRADICTION] marker\n` +
     `- If the new source STRENGTHENS existing understanding, note that explicitly\n` +
     `- Output ONLY the delimited file blocks; no extra commentary`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   const pages = parseFileBlocks(content);
@@ -264,7 +271,8 @@ async function step5Findings(
   sourceSummary: string,
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: CompoundCallbacks
+  callbacks?: CompoundCallbacks,
+  signal?: AbortSignal
 ): Promise<string[]> {
   callbacks?.onReasoningChunk?.(`[Compound] Step 5/6: Extracting and merging findings...`);
 
@@ -289,11 +297,11 @@ async function step5Findings(
     `- Only include significant claims actually supported by the new source\n` +
     `- If a finding page already exists, MERGE new info or create a related finding page\n` +
     `- Add cross-links to related entities and concepts using [[wikilink]] syntax\n` +
-    `- If the new source CONTRADICTS an existing finding, flag it with a ⚠️ marker and explain both claims\n` +
+    `- If the new source CONTRADICTS an existing finding, flag it with a [CONTRADICTION] marker and explain both claims\n` +
     `- If the new source STRENGTHENS or CHALLENGES an existing finding, note that explicitly\n` +
     `- Output ONLY the delimited file blocks; no extra commentary`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   const pages = parseFileBlocks(content);
@@ -330,34 +338,35 @@ export async function compoundDocument(
   chunks: DocumentChunk[],
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: CompoundCallbacks
+  callbacks?: CompoundCallbacks,
+  signal?: AbortSignal
 ): Promise<CompoundResult> {
   const allPages: string[] = [];
 
   try {
     // Step 1: Source summary
-    const sourceSummary = await step1SourceSummary(documentName, chunks, apiConfig, wikiId, callbacks);
+    const sourceSummary = await step1SourceSummary(documentName, chunks, apiConfig, wikiId, callbacks, signal);
     const safeDocName = sanitizeFilename(documentName);
     allPages.push(`sources/${safeDocName}.md`);
 
     // Step 2: Index
-    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks);
+    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks, signal);
     allPages.push('index.md');
 
     // Step 3: Entities
-    const entityPages = await step3Entities(documentName, sourceSummary, apiConfig, wikiId, callbacks);
+    const entityPages = await step3Entities(documentName, sourceSummary, apiConfig, wikiId, callbacks, signal);
     allPages.push(...entityPages);
 
     // Step 4: Concepts
-    const conceptPages = await step4Concepts(documentName, sourceSummary, apiConfig, wikiId, callbacks);
+    const conceptPages = await step4Concepts(documentName, sourceSummary, apiConfig, wikiId, callbacks, signal);
     allPages.push(...conceptPages);
 
     // Step 5: Findings
-    const findingPages = await step5Findings(documentName, sourceSummary, apiConfig, wikiId, callbacks);
+    const findingPages = await step5Findings(documentName, sourceSummary, apiConfig, wikiId, callbacks, signal);
     allPages.push(...findingPages);
 
     // Re-update index with all pages
-    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks);
+    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks, signal);
 
     // Step 6: Log
     await step6Log(documentName, allPages, wikiId);
@@ -378,4 +387,66 @@ export async function compoundDocument(
       error,
     };
   }
+}
+
+/**
+ * AgentFn implementation of document compounding.
+ * Receives { documentName, chunks } JSON via `ctx.currentDraft`.
+ */
+export async function compoundDocumentAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  checkAborted(ctx);
+  const input = JSON.parse(ctx.currentDraft) as { documentName: string; chunks: DocumentChunk[] };
+  const documentName = input.documentName;
+  const chunks = input.chunks;
+  const apiConfig = ctx.apiConfig;
+  const wikiId = ctx.wikiId ?? 'default';
+  const allPages: string[] = [];
+
+  const stepCallbacks: CompoundCallbacks = {
+    onReasoningChunk: (chunk) => emitReasoning(chunk, onReasoningChunk, onUpdate),
+    onStepComplete: (step, pages) => {
+      emitReasoning(`[Compound] Step complete: ${step} → ${pages.join(', ')}`, onReasoningChunk, onUpdate);
+    },
+  };
+
+  // Step 1: Source summary
+  const sourceSummary = await step1SourceSummary(documentName, chunks, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  const safeDocName = sanitizeFilename(documentName);
+  allPages.push(`sources/${safeDocName}.md`);
+
+  // Step 2: Index
+  await step2Index(documentName, allPages, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push('index.md');
+
+  // Step 3: Entities
+  const entityPages = await step3Entities(documentName, sourceSummary, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push(...entityPages);
+
+  // Step 4: Concepts
+  const conceptPages = await step4Concepts(documentName, sourceSummary, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push(...conceptPages);
+
+  // Step 5: Findings
+  const findingPages = await step5Findings(documentName, sourceSummary, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push(...findingPages);
+
+  // Re-update index with all pages
+  await step2Index(documentName, allPages, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+
+  // Step 6: Log
+  await step6Log(documentName, allPages, wikiId);
+  allPages.push('log.md');
+
+  emitReasoning(`[Compound] Complete. ${allPages.length} pages affected.`, onReasoningChunk, onUpdate);
+
+  const uniquePages = [...new Set(allPages)];
+  return buildAgentOutput({
+    draft: JSON.stringify({ pagesAffected: uniquePages }),
+    reasoning: `Compounded ${documentName} into wiki ${wikiId}. ${uniquePages.length} pages affected.`,
+    metadata: { pagesAffected: uniquePages },
+  });
 }

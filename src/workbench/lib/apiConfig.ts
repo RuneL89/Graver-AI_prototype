@@ -61,7 +61,8 @@ export const providerOptions: { value: ApiProvider; label: string; defaultModel:
 export async function callLLM(
   config: ApiConfig,
   prompt: string,
-  modelOverride?: string
+  modelOverride?: string,
+  signal?: AbortSignal
 ): Promise<{ content: string; reasoning?: string }> {
   const url = config.baseUrl.trim()
     ? `${config.baseUrl.replace(/\/$/, '')}/chat/completions`
@@ -78,7 +79,7 @@ export async function callLLM(
   const { response } = await fetchWithAdaptiveRetry(url, {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${config.apiKey}`,
-  }, body);
+  }, body, 2, signal);
 
   const data = await response.json();
   const message = data.choices?.[0]?.message;
@@ -99,7 +100,8 @@ export async function streamLLM(
   config: ApiConfig,
   prompt: string,
   callbacks: StreamCallbacks,
-  modelOverride?: string
+  modelOverride?: string,
+  signal?: AbortSignal
 ): Promise<{ diagnostics: string[] }> {
   const url = config.baseUrl.trim()
     ? `${config.baseUrl.replace(/\/$/, '')}/chat/completions`
@@ -128,7 +130,7 @@ export async function streamLLM(
     const { response } = await fetchWithAdaptiveRetry(url, {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${config.apiKey}`,
-    }, requestBody);
+    }, requestBody, 2, signal);
 
     if (!response.body) {
       throw new Error('No response body');
@@ -139,6 +141,10 @@ export async function streamLLM(
     let buffer = '';
 
     while (true) {
+      if (signal?.aborted) {
+        reader.cancel().catch(() => {});
+        throw new Error('Aborted');
+      }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -215,6 +221,9 @@ export async function streamLLM(
     return { diagnostics };
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
+    if (error.name === 'AbortError' || error.message === 'Aborted') {
+      throw new Error('Pipeline aborted by user');
+    }
     diagnostics.push(`ERROR: ${error.message}`);
     callbacks.onError?.(error);
     throw error;
@@ -280,7 +289,11 @@ export async function testTtsApiKey(key: string): Promise<{ success: boolean; me
     const msg = errorData.error?.message || `HTTP ${response.status}`;
     return { success: false, message: `Connection failed: ${msg}` };
   } catch (err) {
-    return { success: false, message: `Connection failed: ${err instanceof Error ? err.message : String(err)}` };
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === 'Pipeline aborted by user' || (err as Error)?.name === 'AbortError') {
+      throw new Error('Pipeline aborted by user');
+    }
+    return { success: false, message: `Connection failed: ${msg}` };
   }
 }
 

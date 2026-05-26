@@ -1,4 +1,4 @@
-import { Loader2, CheckCircle, AlertCircle, Globe, BookOpen } from 'lucide-react';
+import { Loader2, CheckCircle, AlertCircle, Globe, BookOpen, RotateCcw } from 'lucide-react';
 import type { ResearchTaskStatus } from '../../workbench/tiprouter/researchLoop';
 
 interface ResearchMonitorProps {
@@ -11,6 +11,7 @@ export default function ResearchMonitor({ tasks }: ResearchMonitorProps) {
   const completed = tasks.filter((t) => t.state === 'completed').length;
   const failed = tasks.filter((t) => t.state === 'failed').length;
   const running = tasks.filter((t) => t.state === 'running').length;
+  const stalled = tasks.filter((t) => t.state === 'stalled').length;
 
   return (
     <div className="mt-4">
@@ -18,6 +19,7 @@ export default function ResearchMonitor({ tasks }: ResearchMonitorProps) {
       <div className="text-xs text-muted-foreground mb-2">
         {running > 0 && <span className="mr-3">{running} running</span>}
         {completed > 0 && <span className="mr-3 text-green-400">{completed} completed</span>}
+        {stalled > 0 && <span className="mr-3 text-amber-400">{stalled} stalled</span>}
         {failed > 0 && <span className="text-red-400">{failed} failed</span>}
       </div>
 
@@ -27,6 +29,7 @@ export default function ResearchMonitor({ tasks }: ResearchMonitorProps) {
             <div className="mt-0.5">
               {task.state === 'pending' && <div className="w-4 h-4 rounded-full border-2 border-muted-foreground" />}
               {task.state === 'running' && <Loader2 className="w-4 h-4 animate-spin text-primary" />}
+              {task.state === 'stalled' && <RotateCcw className="w-4 h-4 text-amber-400" />}
               {task.state === 'completed' && <CheckCircle className="w-4 h-4 text-green-500" />}
               {task.state === 'failed' && <AlertCircle className="w-4 h-4 text-red-400" />}
             </div>

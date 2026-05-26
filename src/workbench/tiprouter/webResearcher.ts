@@ -2,6 +2,9 @@ import type { ApiConfig } from '../types-shared';
 import type { SubClaim, EvidenceFinding } from '../types';
 import { callLLM } from '../lib/apiConfig';
 import { dbSet } from '../lib/fileManager';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { checkAborted, emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
 
 export interface WebResearchCallbacks {
   onReasoningChunk?: (chunk: string) => void;
@@ -188,6 +191,126 @@ export async function researchSubClaimWeb(
     callbacks?.onReasoningChunk?.(`[WebResearcher] Error: ${error}`);
     return { success: false, findings, error };
   }
+}
+
+/**
+ * AgentFn implementation of web research.
+ * Receives sub-claim JSON via `ctx.currentDraft`.
+ */
+export async function researchSubClaimWebAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  checkAborted(ctx);
+  const subClaim: SubClaim = JSON.parse(ctx.currentDraft);
+  const apiConfig = ctx.apiConfig;
+  const braveApiKey = ctx.braveApiKey;
+  const braveProxyUrl = ctx.braveProxyUrl;
+  const findings: EvidenceFinding[] = [];
+
+  emitReasoning(`[WebResearcher] Searching: ${subClaim.question}`, onReasoningChunk, onUpdate);
+
+  const searchResults = await searchBrave(subClaim.question, braveApiKey, braveProxyUrl, 5);
+  const results = searchResults.web?.results || [];
+
+  if (results.length === 0) {
+    emitReasoning(`[WebResearcher] No search results for: ${subClaim.question}`, onReasoningChunk, onUpdate);
+    return buildAgentOutput({
+      draft: JSON.stringify({ findings: [] }),
+      reasoning: `No search results for: ${subClaim.question}`,
+      metadata: { findings: [] },
+    });
+  }
+
+  emitReasoning(`[WebResearcher] Found ${results.length} results. Extracting passages...`, onReasoningChunk, onUpdate);
+
+  const pagesToFetch = results.slice(0, 3);
+  const pageTexts: Array<{ url: string; title: string; text: string }> = [];
+
+  for (const result of pagesToFetch) {
+    const text = await fetchPageText(result.url);
+    if (text.length > 200) {
+      pageTexts.push({ url: result.url, title: result.title, text });
+    }
+  }
+
+  if (pageTexts.length === 0) {
+    emitReasoning(`[WebResearcher] Could not fetch any pages for: ${subClaim.question}`, onReasoningChunk, onUpdate);
+    return buildAgentOutput({
+      draft: JSON.stringify({ findings: [] }),
+      reasoning: `Could not fetch any pages for: ${subClaim.question}`,
+      metadata: { findings: [] },
+    });
+  }
+
+  const prompt =
+    `You are analyzing web sources for an investigative research task.\n\n` +
+    `# Sub-claim:\nQuestion: ${subClaim.question}\nClaim: ${subClaim.claim}\n\n` +
+    `# Web sources:\n` +
+    pageTexts
+      .map((p, i) => `## Source ${i + 1}: ${p.title}\nURL: ${p.url}\n${p.text.slice(0, 4000)}\n`)
+      .join('\n---\n') +
+    `\n\nFor each source that contains relevant evidence, extract:\n` +
+    `- The most relevant passage (1–3 sentences)\n` +
+    `- A one-sentence summary of how it relates to the sub-claim\n` +
+    `- Confidence: high / medium / low\n\n` +
+    `Output format (JSON array):\n` +
+    `[\n` +
+    `  {\n` +
+    `    "sourceUrl": "...",\n` +
+    `    "passage": "...",\n` +
+    `    "summary": "...",\n` +
+    `    "confidence": "high"\n` +
+    `  }\n` +
+    `]\n\n` +
+    `Only include sources with actual relevance. Output ONLY valid JSON.`;
+
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, ctx.abortSignal);
+  if (reasoning) emitReasoning(reasoning, onReasoningChunk, onUpdate);
+
+  let parsed: Array<{
+    sourceUrl: string;
+    passage: string;
+    summary: string;
+    confidence: string;
+  }>;
+  try {
+    parsed = JSON.parse(content.trim());
+  } catch {
+    const match = content.match(/```json\n([\s\S]*?)\n```/);
+    if (match) {
+      parsed = JSON.parse(match[1].trim());
+    } else {
+      parsed = [];
+    }
+  }
+
+  for (let i = 0; i < parsed.length; i++) {
+    const item = parsed[i];
+    const confidence = ['high', 'medium', 'low'].includes(item.confidence)
+      ? (item.confidence as 'high' | 'medium' | 'low')
+      : 'medium';
+
+    findings.push({
+      id: generateFindingId(i),
+      subClaimId: subClaim.id,
+      sourceType: 'web',
+      sourceUrl: item.sourceUrl,
+      passage: item.passage,
+      summary: item.summary,
+      confidence,
+    });
+  }
+
+  emitReasoning(`[WebResearcher] Extracted ${findings.length} findings.`, onReasoningChunk, onUpdate);
+
+  return buildAgentOutput({
+    draft: JSON.stringify({ findings }),
+    reasoning: `Extracted ${findings.length} web findings for sub-claim ${subClaim.id}`,
+    metadata: { findings },
+    prompt,
+  });
 }
 
 /**

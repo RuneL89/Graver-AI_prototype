@@ -100,8 +100,8 @@ async function runTests() {
   assert('memo has title', markdown.includes('# Evidence Memo'), 'Missing title');
   assert('memo has research questions', markdown.includes('## Research Questions'), 'Missing research questions');
   assert('memo has findings', markdown.includes('## Findings by Sub-Claim'), 'Missing findings');
-  assert('memo has contradictions', markdown.includes('⚠️'), 'Missing contradiction markers');
-  assert('memo has gaps', markdown.includes('🔍'), 'Missing gap markers');
+  assert('memo has contradictions', markdown.includes('[CONTRADICTION]'), 'Missing contradiction markers');
+  assert('memo has gaps', markdown.includes('[GAP]'), 'Missing gap markers');
   assert('memo has source attribution', markdown.includes('## Source Attribution'), 'Missing attribution');
   assert('memo has confidence summary', markdown.includes('## Confidence Summary'), 'Missing confidence');
   assert('memo has disclaimer', markdown.includes('Human review is required'), 'Missing disclaimer');

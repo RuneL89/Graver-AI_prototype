@@ -1,24 +1,23 @@
-import { useState, useCallback } from 'react';
+import { useState } from 'react';
 import { Search, Loader2, AlertCircle } from 'lucide-react';
-import { queryWiki } from '../../workbench/predigestor/querier';
-import type { ApiConfig } from '../../workbench/types-shared';
+import { PipelineRunner } from '../../workbench/lib/pipeline';
+import { workbenchPredigestorAgentMap } from '../../workbench/lib/workbenchAgentMap';
+import { WORKBENCH_PREDIGESTOR_STAGE_DEFS } from '../../workbench/lib/workbenchStages';
+import { createWorkbenchContextBuilder } from '../../workbench/lib/workbenchAgentContext';
+import type { WorkbenchSessionConfig } from '../../workbench/types';
 
 interface WikiQueryProps {
-  apiConfig: ApiConfig;
+  sessionConfig: WorkbenchSessionConfig;
   wikiId: string | null;
 }
 
-export default function WikiQuery({ apiConfig, wikiId }: WikiQueryProps) {
+export default function WikiQuery({ sessionConfig, wikiId }: WikiQueryProps) {
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
   const [pagesRead, setPagesRead] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reasoning, setReasoning] = useState<string[]>([]);
-
-  const appendReasoning = useCallback((chunk: string) => {
-    setReasoning((prev) => [...prev, chunk]);
-  }, []);
 
   const handleQuery = async () => {
     if (!question.trim() || !wikiId) return;
@@ -29,16 +28,32 @@ export default function WikiQuery({ apiConfig, wikiId }: WikiQueryProps) {
     setReasoning([]);
 
     try {
-      const result = await queryWiki(question.trim(), apiConfig, wikiId, {
-        onReasoningChunk: appendReasoning,
-      });
+      const runner = new PipelineRunner(
+        workbenchPredigestorAgentMap as unknown as import('../../workbench/lib/pipelineTypes').AgentMap,
+        {
+          onStateChange: () => {},
+          onComplete: () => {},
+          onError: (err) => setError(err),
+        },
+        {
+          stageDefinitions: WORKBENCH_PREDIGESTOR_STAGE_DEFS,
+          initialStageId: 'query',
+          enableTopicLoop: false,
+          contextBuilder: createWorkbenchContextBuilder(sessionConfig, wikiId),
+        }
+      );
 
-      if (!result.success) {
-        throw new Error(result.error || 'Query failed');
-      }
+      const result = await runner.executeStage(
+        'query',
+        sessionConfig,
+        question.trim(),
+        undefined
+      );
 
-      setAnswer(result.answer);
-      setPagesRead(result.pagesRead);
+      const meta = result.metadata as { answer?: string; pagesRead?: string[] };
+      setAnswer(meta?.answer ?? result.draft);
+      setPagesRead(meta?.pagesRead ?? []);
+      setReasoning(result.reasoning ? [result.reasoning] : []);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

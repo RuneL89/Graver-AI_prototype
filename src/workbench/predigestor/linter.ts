@@ -2,6 +2,9 @@ import type { ApiConfig } from '../types-shared';
 import { callLLM } from '../lib/apiConfig';
 import { listWikiPages, readAllWikiPages } from './schema';
 import schemaMarkdown from './schema.md?raw';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { checkAborted, emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
 
 export interface LintCallbacks {
   onReasoningChunk?: (chunk: string) => void;
@@ -92,7 +95,8 @@ function parseLintIssues(output: string): LintIssue[] {
 export async function lintWiki(
   apiConfig: ApiConfig,
   wikiId: string = 'default',
-  callbacks?: LintCallbacks
+  callbacks?: LintCallbacks,
+  signal?: AbortSignal
 ): Promise<LintResult> {
   try {
     callbacks?.onReasoningChunk?.('[Lint] Reading wiki pages...');
@@ -143,7 +147,7 @@ export async function lintWiki(
       `\`\`\`\n\n` +
       `If no issues are found, output an empty JSON array.`;
 
-    const { content, reasoning } = await callLLM(apiConfig, prompt);
+    const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
     if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
     const issues = parseLintIssues(content);
@@ -162,4 +166,78 @@ export async function lintWiki(
       error,
     };
   }
+}
+
+/**
+ * AgentFn implementation of wiki lint.
+ * Uses `ctx.wikiId` (or `ctx.currentDraft` as fallback).
+ */
+export async function lintWikiAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  checkAborted(ctx);
+  const apiConfig = ctx.apiConfig;
+  const wikiId = ctx.wikiId ?? ctx.currentDraft ?? 'default';
+
+  emitReasoning('[Lint] Reading wiki pages...', onReasoningChunk, onUpdate);
+  const pages = await listWikiPages(wikiId);
+  if (pages.length === 0) {
+    return buildAgentOutput({
+      draft: JSON.stringify({ issues: [] }),
+      reasoning: 'Wiki is empty. Nothing to lint.',
+      metadata: { issues: [], error: 'Wiki is empty. Nothing to lint.' },
+    });
+  }
+
+  const allContent = await readAllWikiPages(wikiId);
+  const pageEntries = Object.entries(allContent);
+  const maxChars = 12000;
+  let wikiText = '';
+  for (const [path, content] of pageEntries) {
+    const snippet = `## ${path}\n${content.slice(0, 2000)}\n\n`;
+    if (wikiText.length + snippet.length > maxChars) break;
+    wikiText += snippet;
+  }
+
+  emitReasoning('[Lint] Analyzing with LLM...', onReasoningChunk, onUpdate);
+  const prompt =
+    `${schemaMarkdown}\n\n` +
+    `You are auditing an investigative wiki.\n\n` +
+    `# Wiki pages (sampled):\n${wikiText}\n\n` +
+    `# Total pages: ${pages.length}\n\n` +
+    `Scan for issues and report them as a JSON array inside a code block.\n\n` +
+    `Each issue must have:\n` +
+    `- severity: "error" | "warning" | "info"\n` +
+    `- type: "contradiction" | "orphan" | "stale" | "missing_ref" | "empty"\n` +
+    `- description: string\n` +
+    `- affectedPages: string[]\n` +
+    `- suggestion?: string\n\n` +
+    `Output format:\n` +
+    `\`\`\`json\n` +
+    `[\n` +
+    `  {\n` +
+    `    "severity": "warning",\n` +
+    `    "type": "orphan",\n` +
+    `    "description": "Page entities/alice-smith.md has no incoming wikilinks.",\n` +
+    `    "affectedPages": ["entities/alice-smith.md"],\n` +
+    `    "suggestion": "Add a reference from findings/consulting-fees.md"\n` +
+    `  }\n` +
+    `]\n` +
+    `\`\`\`\n\n` +
+    `If no issues are found, output an empty JSON array.`;
+
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, ctx.abortSignal);
+  if (reasoning) emitReasoning(reasoning, onReasoningChunk, onUpdate);
+
+  const issues = parseLintIssues(content);
+  emitReasoning(`[Lint] Found ${issues.length} issue(s).`, onReasoningChunk, onUpdate);
+
+  return buildAgentOutput({
+    draft: JSON.stringify({ issues }),
+    reasoning: `Found ${issues.length} lint issue(s) in wiki ${wikiId}`,
+    metadata: { issues },
+    prompt,
+  });
 }

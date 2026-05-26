@@ -168,39 +168,48 @@ export async function fetchWithAdaptiveRetry(
   url: string,
   headers: Record<string, string>,
   body: Record<string, unknown>,
-  maxRetries = 2
+  maxRetries = 2,
+  signal?: AbortSignal
 ): Promise<{ response: Response; finalBody: Record<string, unknown> }> {
   let currentBody = { ...body };
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(currentBody),
-    });
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(currentBody),
+        signal,
+      });
 
-    if (response.ok) {
-      return { response, finalBody: currentBody };
-    }
+      if (response.ok) {
+        return { response, finalBody: currentBody };
+      }
 
-    // Only attempt fixes for 4xx errors (bad request / unsupported parameter)
-    if (response.status < 400 || response.status >= 500) {
+      // Only attempt fixes for 4xx errors (bad request / unsupported parameter)
+      if (response.status < 400 || response.status >= 500) {
+        const errorData = await response.json().catch(() => ({}));
+        const errorMessage = errorData.error?.message || `HTTP ${response.status}`;
+        throw new Error(errorMessage);
+      }
+
       const errorData = await response.json().catch(() => ({}));
-      const errorMessage = errorData.error?.message || `HTTP ${response.status}`;
+      const errorMessage: string = errorData.error?.message || `HTTP ${response.status}`;
+
+      const fixedBody = tryFixParameterError(errorMessage, currentBody);
+      if (fixedBody) {
+        currentBody = fixedBody;
+        continue; // Retry with fixed body
+      }
+
+      // Not a fixable parameter error
       throw new Error(errorMessage);
+    } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || err.message === 'Aborted')) {
+        throw new Error('Pipeline aborted by user');
+      }
+      throw err;
     }
-
-    const errorData = await response.json().catch(() => ({}));
-    const errorMessage: string = errorData.error?.message || `HTTP ${response.status}`;
-
-    const fixedBody = tryFixParameterError(errorMessage, currentBody);
-    if (fixedBody) {
-      currentBody = fixedBody;
-      continue; // Retry with fixed body
-    }
-
-    // Not a fixable parameter error
-    throw new Error(errorMessage);
   }
 
   throw new Error('Max adaptive retries exceeded');

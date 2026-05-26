@@ -8,6 +8,9 @@ import {
   readWikiPageTitle,
 } from './schema';
 import schemaMarkdown from './schema.md?raw';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { checkAborted, emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
 
 export interface IngestCallbacks {
   onReasoningChunk?: (chunk: string) => void;
@@ -80,7 +83,8 @@ async function step1SourceSummary(
   chunks: DocumentChunk[],
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: IngestCallbacks
+  callbacks?: IngestCallbacks,
+  signal?: AbortSignal
 ): Promise<string> {
   const safeDocName = sanitizeFilename(documentName);
   const path = `sources/${safeDocName}.md`;
@@ -102,7 +106,7 @@ async function step1SourceSummary(
     `- Use [[wikilink]] syntax for cross-references\n\n` +
     `Output ONLY the markdown content for the page. Do not wrap in delimiters.`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   await writeWikiPage(path, content.trim(), wikiId);
@@ -118,7 +122,8 @@ async function step2Index(
   newPages: string[],
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: IngestCallbacks
+  callbacks?: IngestCallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   callbacks?.onReasoningChunk?.(`[Ingest] Step 2/6: Updating index.md...`);
 
@@ -139,7 +144,7 @@ async function step2Index(
     `- Include a brief intro paragraph at the top\n\n` +
     `Output ONLY the markdown content for index.md.`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   await writeWikiPage('index.md', content.trim(), wikiId);
@@ -154,7 +159,8 @@ async function step3Entities(
   sourceSummary: string,
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: IngestCallbacks
+  callbacks?: IngestCallbacks,
+  signal?: AbortSignal
 ): Promise<string[]> {
   callbacks?.onReasoningChunk?.(`[Ingest] Step 3/6: Extracting entities...`);
 
@@ -177,7 +183,7 @@ async function step3Entities(
     `- Use [[wikilink]] syntax for cross-references\n` +
     `- Output ONLY the delimited file blocks; no extra commentary`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   const pages = parseFileBlocks(content);
@@ -198,7 +204,8 @@ async function step4Concepts(
   sourceSummary: string,
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: IngestCallbacks
+  callbacks?: IngestCallbacks,
+  signal?: AbortSignal
 ): Promise<string[]> {
   callbacks?.onReasoningChunk?.(`[Ingest] Step 4/6: Extracting concepts...`);
 
@@ -221,7 +228,7 @@ async function step4Concepts(
     `- Use [[wikilink]] syntax for cross-references\n` +
     `- Output ONLY the delimited file blocks; no extra commentary`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   const pages = parseFileBlocks(content);
@@ -242,7 +249,8 @@ async function step5Findings(
   sourceSummary: string,
   apiConfig: ApiConfig,
   wikiId: string,
-  callbacks?: IngestCallbacks
+  callbacks?: IngestCallbacks,
+  signal?: AbortSignal
 ): Promise<string[]> {
   callbacks?.onReasoningChunk?.(`[Ingest] Step 5/6: Extracting findings...`);
 
@@ -267,7 +275,7 @@ async function step5Findings(
     `- Use [[wikilink]] syntax for cross-references\n` +
     `- Output ONLY the delimited file blocks; no extra commentary`;
 
-  const { content, reasoning } = await callLLM(apiConfig, prompt);
+  const { content, reasoning } = await callLLM(apiConfig, prompt, undefined, signal);
   if (reasoning) callbacks?.onReasoningChunk?.(reasoning);
 
   const pages = parseFileBlocks(content);
@@ -304,35 +312,36 @@ export async function ingestDocument(
   chunks: DocumentChunk[],
   apiConfig: ApiConfig,
   wikiId: string = 'default',
-  callbacks?: IngestCallbacks
+  callbacks?: IngestCallbacks,
+  signal?: AbortSignal
 ): Promise<IngestResult> {
   const allPages: string[] = [];
 
   try {
     // Step 1: Source summary
-    const sourceSummary = await step1SourceSummary(documentName, chunks, apiConfig, wikiId, callbacks);
+    const sourceSummary = await step1SourceSummary(documentName, chunks, apiConfig, wikiId, callbacks, signal);
     const safeDocName = sanitizeFilename(documentName);
     allPages.push(`sources/${safeDocName}.md`);
 
     // Step 2: Index (passing pages generated so far; entities/concepts/findings not yet done)
     // We update index again after steps 3-5
-    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks);
+    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks, signal);
     allPages.push('index.md');
 
     // Step 3: Entities
-    const entityPages = await step3Entities(documentName, sourceSummary, apiConfig, wikiId, callbacks);
+    const entityPages = await step3Entities(documentName, sourceSummary, apiConfig, wikiId, callbacks, signal);
     allPages.push(...entityPages);
 
     // Step 4: Concepts
-    const conceptPages = await step4Concepts(documentName, sourceSummary, apiConfig, wikiId, callbacks);
+    const conceptPages = await step4Concepts(documentName, sourceSummary, apiConfig, wikiId, callbacks, signal);
     allPages.push(...conceptPages);
 
     // Step 5: Findings
-    const findingPages = await step5Findings(documentName, sourceSummary, apiConfig, wikiId, callbacks);
+    const findingPages = await step5Findings(documentName, sourceSummary, apiConfig, wikiId, callbacks, signal);
     allPages.push(...findingPages);
 
     // Re-update index with all pages
-    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks);
+    await step2Index(documentName, allPages, apiConfig, wikiId, callbacks, signal);
 
     // Step 6: Log
     await step6Log(documentName, allPages, wikiId);
@@ -353,4 +362,66 @@ export async function ingestDocument(
       error,
     };
   }
+}
+
+/**
+ * AgentFn implementation of document ingestion.
+ * Receives { documentName, chunks } JSON via `ctx.currentDraft`.
+ */
+export async function ingestDocumentAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  checkAborted(ctx);
+  const input = JSON.parse(ctx.currentDraft) as { documentName: string; chunks: DocumentChunk[] };
+  const documentName = input.documentName;
+  const chunks = input.chunks;
+  const apiConfig = ctx.apiConfig;
+  const wikiId = ctx.wikiId ?? 'default';
+  const allPages: string[] = [];
+
+  const stepCallbacks: IngestCallbacks = {
+    onReasoningChunk: (chunk) => emitReasoning(chunk, onReasoningChunk, onUpdate),
+    onStepComplete: (step, pages) => {
+      emitReasoning(`[Ingest] Step complete: ${step} → ${pages.join(', ')}`, onReasoningChunk, onUpdate);
+    },
+  };
+
+  // Step 1: Source summary
+  const sourceSummary = await step1SourceSummary(documentName, chunks, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  const safeDocName = sanitizeFilename(documentName);
+  allPages.push(`sources/${safeDocName}.md`);
+
+  // Step 2: Index
+  await step2Index(documentName, allPages, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push('index.md');
+
+  // Step 3: Entities
+  const entityPages = await step3Entities(documentName, sourceSummary, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push(...entityPages);
+
+  // Step 4: Concepts
+  const conceptPages = await step4Concepts(documentName, sourceSummary, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push(...conceptPages);
+
+  // Step 5: Findings
+  const findingPages = await step5Findings(documentName, sourceSummary, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+  allPages.push(...findingPages);
+
+  // Re-update index with all pages
+  await step2Index(documentName, allPages, apiConfig, wikiId, stepCallbacks, ctx.abortSignal);
+
+  // Step 6: Log
+  await step6Log(documentName, allPages, wikiId);
+  allPages.push('log.md');
+
+  emitReasoning(`[Ingest] Complete. ${allPages.length} pages affected.`, onReasoningChunk, onUpdate);
+
+  const uniquePages = [...new Set(allPages)];
+  return buildAgentOutput({
+    draft: JSON.stringify({ pagesGenerated: uniquePages }),
+    reasoning: `Ingested ${documentName} into wiki ${wikiId}. ${uniquePages.length} pages affected.`,
+    metadata: { pagesGenerated: uniquePages },
+  });
 }

@@ -1,5 +1,8 @@
 import type { ResearchPlan, Synthesis, EvidenceFinding, EvidenceMemo } from '../types';
 import { dbGet } from '../lib/fileManager';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { checkAborted, emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
 
 async function loadPlan(tipId: string): Promise<ResearchPlan | null> {
   const raw = await dbGet(`research-plan/${tipId}`);
@@ -89,7 +92,7 @@ export function buildEvidenceMemoMarkdown(
       lines.push('**Contradictions:**');
       lines.push('');
       for (const c of entry.contradictions) {
-        lines.push(`- ⚠️ **${c.between.join(' vs ')}:** ${c.description}`);
+        lines.push(`- **[CONTRADICTION]** **${c.between.join(' vs ')}:** ${c.description}`);
       }
       lines.push('');
     }
@@ -98,7 +101,7 @@ export function buildEvidenceMemoMarkdown(
       lines.push('**Gaps:**');
       lines.push('');
       for (const g of entry.gaps) {
-        lines.push(`- 🔍 ${g}`);
+        lines.push(`- **[GAP]** ${g}`);
       }
       lines.push('');
     }
@@ -204,4 +207,58 @@ export async function assembleEvidenceMemo(tipId: string): Promise<AssembleResul
     const error = err instanceof Error ? err.message : String(err);
     return { success: false, error };
   }
+}
+
+/**
+ * AgentFn implementation of report assembler.
+ * Receives tipId via `ctx.currentDraft`.
+ */
+export async function assembleEvidenceMemoAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  checkAborted(ctx);
+  const tipId = ctx.currentDraft;
+
+  emitReasoning('[ReportAssembler] Assembling evidence memo...', onReasoningChunk, onUpdate);
+
+  const plan = await loadPlan(tipId);
+  if (!plan) {
+    throw new Error('Research plan not found');
+  }
+
+  const synthesis = await loadSynthesis(tipId);
+  if (!synthesis) {
+    throw new Error('Synthesis not found');
+  }
+
+  const { external, internal } = await loadEvidence(tipId);
+
+  const markdown = buildEvidenceMemoMarkdown(plan, synthesis, external, internal);
+
+  const confidenceSummary: Record<string, 'high' | 'medium' | 'low'> = {};
+  for (const entry of synthesis.entries) {
+    const hasSupport = entry.supportingSources.length > 0;
+    const hasContradiction = entry.contradictions.length > 0;
+    confidenceSummary[entry.subClaimId] = hasSupport && !hasContradiction ? 'high' : hasSupport ? 'medium' : 'low';
+  }
+
+  const memo: EvidenceMemo = {
+    tip: { id: plan.tipId, text: '', createdAt: plan.createdAt },
+    researchPlan: plan,
+    findings: synthesis.entries,
+    contradictions: synthesis.entries.flatMap((e) => e.contradictions),
+    gaps: synthesis.entries.flatMap((e) => e.gaps),
+    confidenceSummary,
+    generatedAt: new Date().toISOString(),
+  };
+
+  emitReasoning('[ReportAssembler] Memo assembled.', onReasoningChunk, onUpdate);
+
+  return buildAgentOutput({
+    draft: markdown,
+    reasoning: `Assembled evidence memo for tip ${tipId} with ${synthesis.entries.length} entries`,
+    metadata: { memo },
+  });
 }

@@ -1,12 +1,32 @@
-import { useState, useCallback } from 'react';
-import { Lightbulb, Loader2, AlertCircle, CheckCircle, Play, ShieldCheck, FileText, RotateCcw, BookOpen } from 'lucide-react';
-import { decomposeTip, type DecomposeResult } from '../../workbench/tiprouter/decomposer';
-import { runParallelResearch, type ResearchLoopResult, type ResearchTaskStatus } from '../../workbench/tiprouter/researchLoop';
-import { runSynthesisLoop, type SynthesisLoopResult } from '../../workbench/tiprouter/synthesisLoop';
+import { useState, useRef } from 'react';
+import {
+  Lightbulb,
+  AlertCircle,
+  CheckCircle,
+  Play,
+  Pause,
+  FileText,
+  RotateCcw,
+  BookOpen,
+  Square,
+} from 'lucide-react';
+import { PipelineNotifications } from '../../workbench/lib/pipelineNotifications';
+import { PipelineRunner } from '../../workbench/lib/pipeline';
+import { workbenchTipRouterAgentMap } from '../../workbench/lib/workbenchAgentMap';
+import {
+  WORKBENCH_TIP_ROUTER_STAGE_DEFS,
+  WORKBENCH_TIP_ROUTER_ORDER,
+  getWorkbenchNextStage,
+} from '../../workbench/lib/workbenchStages';
+import { createWorkbenchContextBuilder } from '../../workbench/lib/workbenchAgentContext';
 import type { WorkbenchSessionConfig } from '../../workbench/types';
 import type { ResearchPlan, EvidenceAudit } from '../../workbench/types';
 import type { PipelineStage } from '../../workbench/session';
+import type { ResearchTaskStatus } from '../../workbench/tiprouter/researchLoop';
 import ResearchMonitor from './ResearchMonitor';
+import PipelineVisualizer from './PipelineVisualizer';
+import AgentDashboard from './AgentDashboard';
+import PromptInspector from './PromptInspector';
 
 interface TipInputProps {
   sessionConfig: WorkbenchSessionConfig;
@@ -17,151 +37,172 @@ interface TipInputProps {
 
 export default function TipInput({ sessionConfig, wikiId, onTipCreated, onStageChange }: TipInputProps) {
   const [tipText, setTipText] = useState('');
-  const [phase, setPhase] = useState<'idle' | 'decomposing' | 'researching' | 'done' | 'error'>('idle');
+  const [phase, setPhase] = useState<'idle' | 'running' | 'paused' | 'done' | 'error'>('idle');
 
   const setStage = (stage: PipelineStage) => {
     onStageChange?.(stage);
   };
   const [error, setError] = useState<string | null>(null);
   const [plan, setPlan] = useState<ResearchPlan | null>(null);
-  const [researchResult, setResearchResult] = useState<ResearchLoopResult | null>(null);
   const [taskStatuses, setTaskStatuses] = useState<ResearchTaskStatus[]>([]);
-  const [synthesisResult, setSynthesisResult] = useState<SynthesisLoopResult | null>(null);
+  const [synthesisEntries, setSynthesisEntries] = useState<number>(0);
+  const [finalAudit, setFinalAudit] = useState<EvidenceAudit | null>(null);
   const [auditIterations, setAuditIterations] = useState<{ iteration: number; audit: EvidenceAudit }[]>([]);
   const [reasoning, setReasoning] = useState<string[]>([]);
+  const [currentRunnerStage, setCurrentRunnerStage] = useState<string | null>(null);
+  const [runnerState, setRunnerState] = useState<import('../../workbench/lib/pipelineTypes').PipelineState | null>(null);
 
-  const appendReasoning = useCallback((chunk: string) => {
-    setReasoning((prev) => [...prev, chunk]);
-  }, []);
+  const runnerRef = useRef<PipelineRunner<WorkbenchSessionConfig> | null>(null);
 
-  const handleDecompose = async () => {
+  const getOrCreateRunner = (): PipelineRunner<WorkbenchSessionConfig> => {
+    if (!runnerRef.current) {
+      runnerRef.current = new PipelineRunner(
+        workbenchTipRouterAgentMap as unknown as import('../../workbench/lib/pipelineTypes').AgentMap,
+        {
+          onStateChange: (state) => {
+            setRunnerState(state);
+            setCurrentRunnerStage(state.currentStageId);
+            // Derive task statuses from research stage metadata if available
+            const researchStage = state.stages.find((s) => s.id === 'research');
+            if (researchStage?.metadata) {
+              const meta = researchStage.metadata as { taskStatuses?: ResearchTaskStatus[] };
+              if (meta.taskStatuses) {
+                setTaskStatuses(meta.taskStatuses);
+              }
+            }
+            // Derive audit status from audit stage
+            const auditStage = state.stages.find((s) => s.id === 'audit');
+            if (auditStage?.metadata) {
+              const meta = auditStage.metadata as { audit?: EvidenceAudit };
+              if (meta.audit) {
+                setFinalAudit(meta.audit);
+                setAuditIterations((prev) => {
+                  const exists = prev.some((p) => p.iteration === auditStage.iteration);
+                  if (exists) return prev;
+                  return [...prev, { iteration: auditStage.iteration, audit: meta.audit! }];
+                });
+              }
+            }
+            // Derive synthesis entries
+            const synthesizeStage = state.stages.find((s) => s.id === 'synthesize');
+            if (synthesizeStage?.metadata) {
+              const meta = synthesizeStage.metadata as { synthesis?: { entries?: unknown[] } };
+              if (meta.synthesis?.entries) {
+                setSynthesisEntries(meta.synthesis.entries.length);
+              }
+            }
+          },
+          onComplete: (_draft) => {
+            setPhase('done');
+            setStage('done');
+            PipelineNotifications.notifyComplete('Pipeline Complete', 'The investigative pipeline has finished.');
+          },
+          onError: (err) => {
+            setPhase('error');
+            setStage('error');
+            setError(err);
+            PipelineNotifications.notifyAttention('Pipeline Error', err);
+          },
+        },
+        {
+          stageDefinitions: WORKBENCH_TIP_ROUTER_STAGE_DEFS,
+          getNextStage: getWorkbenchNextStage,
+          initialStageId: 'decompose',
+          stageOrder: WORKBENCH_TIP_ROUTER_ORDER,
+          enableTopicLoop: false,
+          contextBuilder: createWorkbenchContextBuilder(sessionConfig, wikiId),
+        }
+      );
+    }
+    return runnerRef.current;
+  };
+
+  const handleRun = async () => {
     if (!tipText.trim()) return;
-    setPhase('decomposing');
+    setPhase('running');
     setStage('decomposing');
     setError(null);
     setPlan(null);
-    setResearchResult(null);
     setTaskStatuses([]);
-    setSynthesisResult(null);
+    setSynthesisEntries(0);
+    setFinalAudit(null);
     setAuditIterations([]);
     setReasoning([]);
+    runnerRef.current = null;
 
     try {
-      const result: DecomposeResult = await decomposeTip(
-        tipText.trim(),
-        sessionConfig.apiConfig,
-        {
-          onReasoningChunk: appendReasoning,
+      const runner = getOrCreateRunner();
+      await runner.run(sessionConfig);
+
+      const finalState = runner.getState();
+      const decomposeStage = finalState.stages.find((s) => s.id === 'decompose');
+      if (decomposeStage?.status === 'completed') {
+        try {
+          const meta = decomposeStage.metadata as { plan?: ResearchPlan };
+          if (meta?.plan) {
+            setPlan(meta.plan);
+            onTipCreated?.(meta.plan.tipId);
+          }
+        } catch {
+          // ignore
         }
-      );
-
-      if (!result.success || !result.plan) {
-        throw new Error(result.error || 'Decomposition failed');
       }
-
-      setPlan(result.plan);
-      setPhase('done');
-      setStage('idle');
-      onTipCreated?.(result.plan.tipId);
     } catch (err) {
-      setPhase('error');
-      setStage('error');
-      setError(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg !== 'Pipeline aborted by user') {
+        setPhase('error');
+        setStage('error');
+        setError(msg);
+      } else {
+        setPhase('idle');
+        setStage('idle');
+      }
     }
   };
 
-  const handleResearch = async () => {
-    if (!plan) return;
-    setPhase('researching');
-    setStage('researching');
-    setError(null);
-    setResearchResult(null);
-    setSynthesisResult(null);
-    setAuditIterations([]);
-    setTaskStatuses(
-      plan.subClaims.map((sc) => ({
-        subClaimId: sc.id,
-        subClaimQuestion: sc.question,
-        state: 'pending' as const,
-        webFindingsCount: 0,
-        wikiFindingsCount: 0,
-      }))
-    );
+  const handlePause = () => {
+    runnerRef.current?.pause();
+    setPhase('paused');
+  };
 
-    try {
-      const result = await runParallelResearch(
-        plan,
-        sessionConfig.apiConfig,
-        sessionConfig.braveApiKey,
-        sessionConfig.braveProxyUrl,
-        wikiId,
-        {
-          onReasoningChunk: appendReasoning,
-          onTaskUpdate: (status) => {
-            setTaskStatuses((prev) => {
-              const idx = prev.findIndex((t) => t.subClaimId === status.subClaimId);
-              if (idx === -1) return [...prev, status];
-              const next = [...prev];
-              next[idx] = status;
-              return next;
-            });
-          },
+  const handleResume = async () => {
+    if (!runnerRef.current) return;
+    setPhase('running');
+    runnerRef.current?.resume();
+    const state = runnerRef.current.getState();
+    const currentStage = state.currentStageId;
+    if (currentStage) {
+      try {
+        await runnerRef.current.runFromStage(currentStage, sessionConfig, state);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg !== 'Pipeline aborted by user') {
+          setPhase('error');
+          setStage('error');
+          setError(msg);
+        } else {
+          setPhase('idle');
+          setStage('idle');
         }
-      );
-
-      if (!result.success) {
-        throw new Error(result.error || 'Research failed');
       }
-
-      setResearchResult(result);
-      setPhase('done');
-      setStage('idle');
-    } catch (err) {
-      setPhase('error');
-      setStage('error');
-      setError(err instanceof Error ? err.message : String(err));
     }
   };
 
-  const handleSynthesize = async () => {
-    if (!plan) return;
-    setPhase('researching');
-    setStage('synthesizing');
-    setError(null);
-    setSynthesisResult(null);
-    setAuditIterations([]);
-
-    try {
-      const result = await runSynthesisLoop(plan.tipId, sessionConfig.apiConfig, {
-        onReasoningChunk: appendReasoning,
-        onAuditIteration: (iteration, audit) => {
-          setAuditIterations((prev) => [...prev, { iteration, audit }]);
-        },
-      });
-
-      if (!result.success) {
-        throw new Error(result.error || 'Synthesis failed');
-      }
-
-      setSynthesisResult(result);
-      setPhase('done');
-      setStage(result.finalAudit?.approval_status === 'APPROVED' ? 'done' : 'idle');
-    } catch (err) {
-      setPhase('error');
-      setStage('error');
-      setError(err instanceof Error ? err.message : String(err));
-    }
+  const handleCancel = () => {
+    runnerRef.current?.stop();
+    setPhase('idle');
+    setStage('idle');
   };
 
   return (
-    <div className="rounded-lg border border-border p-6">
+    <div className="rounded-lg border border-border p-6 space-y-4">
       <div className="flex items-center gap-2 mb-4">
         <Lightbulb className="w-5 h-5 text-muted-foreground" />
         <h2 className="text-lg font-semibold">Tip Router</h2>
       </div>
 
       <p className="text-sm text-muted-foreground mb-4">
-        Enter an investigative tip. The system will decompose it into sub-claims and research them in parallel.
+        Enter an investigative tip and click Run Investigation to execute the full pipeline automatically.
       </p>
 
       <textarea
@@ -173,46 +214,44 @@ export default function TipInput({ sessionConfig, wikiId, onTipCreated, onStageC
       />
 
       <div className="flex flex-wrap gap-2 mt-3">
-        <button
-          onClick={handleDecompose}
-          disabled={phase === 'decomposing' || !tipText.trim()}
-          className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50 flex items-center gap-2"
-        >
-          {phase === 'decomposing' ? (
-            <Loader2 className="w-4 h-4 animate-spin" />
-          ) : (
-            <Lightbulb className="w-4 h-4" />
-          )}
-          Decompose
-        </button>
-
-        {plan && (
+        {phase === 'idle' && (
           <button
-            onClick={handleResearch}
-            disabled={phase === 'researching'}
-            className="px-4 py-2 rounded bg-secondary text-secondary-foreground text-sm font-medium disabled:opacity-50 flex items-center gap-2"
+            onClick={handleRun}
+            disabled={!tipText.trim()}
+            className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm font-medium disabled:opacity-50 flex items-center gap-2"
           >
-            {phase === 'researching' && !synthesisResult ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Play className="w-4 h-4" />
-            )}
-            Run Research
+            <Play className="w-4 h-4" />
+            Run Investigation
           </button>
         )}
 
-        {researchResult && (
+        {phase === 'running' && (
           <button
-            onClick={handleSynthesize}
-            disabled={phase === 'researching'}
-            className="px-4 py-2 rounded bg-accent text-accent-foreground text-sm font-medium disabled:opacity-50 flex items-center gap-2"
+            onClick={handlePause}
+            className="px-4 py-2 rounded bg-amber-600 text-white text-sm font-medium flex items-center gap-2"
           >
-            {phase === 'researching' && synthesisResult === null ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <ShieldCheck className="w-4 h-4" />
-            )}
-            Synthesize & Audit
+            <Pause className="w-4 h-4" />
+            Pause
+          </button>
+        )}
+
+        {phase === 'paused' && (
+          <button
+            onClick={handleResume}
+            className="px-4 py-2 rounded bg-primary text-primary-foreground text-sm font-medium flex items-center gap-2"
+          >
+            <Play className="w-4 h-4" />
+            Resume
+          </button>
+        )}
+
+        {(phase === 'running' || phase === 'paused') && (
+          <button
+            onClick={handleCancel}
+            className="px-4 py-2 rounded border border-red-500 text-red-400 text-sm font-medium flex items-center gap-2"
+          >
+            <Square className="w-4 h-4" />
+            Cancel
           </button>
         )}
 
@@ -246,6 +285,24 @@ export default function TipInput({ sessionConfig, wikiId, onTipCreated, onStageC
         )}
       </div>
 
+      {runnerState && (
+        <PipelineVisualizer stages={runnerState.stages} currentStageId={runnerState.currentStageId} />
+      )}
+
+      {runnerState && (
+        <AgentDashboard stages={runnerState.stages} />
+      )}
+
+      {runnerRef.current && (
+        <PromptInspector entries={runnerRef.current.getPromptLog()} />
+      )}
+
+      {currentRunnerStage && (
+        <div className="mt-2 text-xs text-muted-foreground">
+          Current stage: <span className="font-medium capitalize">{currentRunnerStage}</span>
+        </div>
+      )}
+
       {error && (
         <div className="mt-4 p-3 rounded bg-red-900/30 text-red-300 text-sm flex items-start gap-2">
           <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -270,47 +327,28 @@ export default function TipInput({ sessionConfig, wikiId, onTipCreated, onStageC
         </div>
       )}
 
-      {phase === 'researching' && (
+      {(phase === 'running' || phase === 'paused') && taskStatuses.length > 0 && (
         <ResearchMonitor tasks={taskStatuses} />
       )}
 
-      {researchResult && (
-        <div className="mt-4 space-y-3">
-          <h3 className="text-sm font-semibold">Research Results</h3>
-          <div className="text-sm bg-muted p-3 rounded">
-            <div>Web findings: {researchResult.externalFindings.length}</div>
-            <div>Wiki findings: {researchResult.internalFindings.length}</div>
-          </div>
-        </div>
-      )}
-
-      {synthesisResult && synthesisResult.synthesis && (
+      {synthesisEntries > 0 && (
         <div className="mt-4 space-y-3">
           <h3 className="text-sm font-semibold flex items-center gap-2">
             <FileText className="w-4 h-4" />
-            Synthesis ({synthesisResult.synthesis.entries.length} entries)
+            Synthesis ({synthesisEntries} entries)
           </h3>
-          <div className="text-sm bg-muted p-3 rounded space-y-2">
-            {synthesisResult.synthesis.entries.map((entry) => (
-              <div key={entry.subClaimId}>
-                <div className="font-medium">{entry.subClaimId}</div>
-                <div className="text-xs text-muted-foreground">
-                  Sources: {entry.supportingSources.length} · Contradictions: {entry.contradictions.length} · Gaps: {entry.gaps.length}
-                </div>
-              </div>
-            ))}
-          </div>
-          {synthesisResult.finalAudit && (
-            <div className={`text-sm p-3 rounded ${
-              synthesisResult.finalAudit.approval_status === 'APPROVED'
-                ? 'bg-green-900/30 text-green-300'
-                : 'bg-amber-900/30 text-amber-300'
-            }`}>
-              <strong>{synthesisResult.finalAudit.approval_status}</strong> after {synthesisResult.iterations} iteration(s)
-              {synthesisResult.finalAudit.rewriter_instructions && (
-                <div className="mt-1 text-xs">{synthesisResult.finalAudit.rewriter_instructions}</div>
-              )}
-            </div>
+        </div>
+      )}
+
+      {finalAudit && (
+        <div className={`mt-4 text-sm p-3 rounded ${
+          finalAudit.approval_status === 'APPROVED'
+            ? 'bg-green-900/30 text-green-300'
+            : 'bg-amber-900/30 text-amber-300'
+        }`}>
+          <strong>{finalAudit.approval_status}</strong>
+          {finalAudit.rewriter_instructions && (
+            <div className="mt-1 text-xs">{finalAudit.rewriter_instructions}</div>
           )}
         </div>
       )}

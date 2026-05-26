@@ -2,11 +2,15 @@ import type { ApiConfig } from '../types-shared';
 import type { ResearchPlan, EvidenceFinding } from '../types';
 import { researchSubClaimWeb, saveExternalEvidence } from './webResearcher';
 import { researchSubClaimWiki, saveInternalEvidence } from './wikiQuerier';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { checkAborted, emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
+import { isRetryableError, MAX_STALL_WAVES } from '../lib/researchStallRecovery';
 
 export interface ResearchTaskStatus {
   subClaimId: string;
   subClaimQuestion: string;
-  state: 'pending' | 'running' | 'completed' | 'failed';
+  state: 'pending' | 'running' | 'completed' | 'stalled' | 'failed';
   webFindingsCount: number;
   wikiFindingsCount: number;
   error?: string;
@@ -27,7 +31,8 @@ export interface ResearchLoopResult {
 
 /**
  * Run parallel research for all sub-claims in a research plan.
- * For each sub-claim, launches WebResearcher and WikiQuerier simultaneously.
+ * Implements round-based stall recovery: stalled sub-claims retry together
+ * after the initial wave completes. Max 3 retry waves.
  */
 export async function runParallelResearch(
   plan: ResearchPlan,
@@ -47,6 +52,9 @@ export async function runParallelResearch(
     wikiFindingsCount: 0,
   }));
 
+  // Accumulate findings per sub-claim across retry waves
+  const subClaimFindings = new Map<string, { external: EvidenceFinding[]; internal: EvidenceFinding[] }>();
+
   function updateStatus(subClaimId: string, partial: Partial<ResearchTaskStatus>) {
     const idx = taskStatuses.findIndex((t) => t.subClaimId === subClaimId);
     if (idx !== -1) {
@@ -55,64 +63,116 @@ export async function runParallelResearch(
     }
   }
 
+  async function runSubClaim(subClaim: typeof plan.subClaims[0]): Promise<{ completed: boolean; retryableError?: string }> {
+    updateStatus(subClaim.id, { state: 'running' });
+
+    const [webResult, wikiResult] = await Promise.allSettled([
+      researchSubClaimWeb(subClaim, apiConfig, braveApiKey, braveProxyUrl, {
+        onReasoningChunk: (chunk) => {
+          callbacks?.onReasoningChunk?.(chunk);
+        },
+      }),
+      researchSubClaimWiki(subClaim, apiConfig, wikiId, {
+        onReasoningChunk: (chunk) => {
+          callbacks?.onReasoningChunk?.(chunk);
+        },
+      }),
+    ]);
+
+    let webFindings: EvidenceFinding[] = [];
+    let wikiFindings: EvidenceFinding[] = [];
+    let retryableError: string | undefined;
+
+    if (webResult.status === 'fulfilled') {
+      if (webResult.value.success) {
+        webFindings = webResult.value.findings;
+      } else if (isRetryableError(webResult.value.error || '')) {
+        retryableError = webResult.value.error;
+      }
+    } else {
+      const err = webResult.reason instanceof Error ? webResult.reason.message : String(webResult.reason);
+      if (isRetryableError(err)) retryableError = err;
+    }
+
+    if (wikiResult.status === 'fulfilled') {
+      if (wikiResult.value.success) {
+        wikiFindings = wikiResult.value.findings;
+      } else if (!retryableError && isRetryableError(wikiResult.value.error || '')) {
+        retryableError = wikiResult.value.error;
+      }
+    } else {
+      const err = wikiResult.reason instanceof Error ? wikiResult.reason.message : String(wikiResult.reason);
+      if (!retryableError && isRetryableError(err)) retryableError = err;
+    }
+
+    // Accumulate findings across waves
+    const existing = subClaimFindings.get(subClaim.id) || { external: [], internal: [] };
+    existing.external.push(...webFindings);
+    existing.internal.push(...wikiFindings);
+    subClaimFindings.set(subClaim.id, existing);
+
+    if (retryableError) {
+      updateStatus(subClaim.id, { state: 'stalled', error: retryableError });
+      return { completed: false, retryableError };
+    }
+
+    updateStatus(subClaim.id, {
+      state: 'completed',
+      webFindingsCount: existing.external.length,
+      wikiFindingsCount: existing.internal.length,
+      error: undefined,
+    });
+    return { completed: true };
+  }
+
   try {
     callbacks?.onReasoningChunk?.(`[ResearchLoop] Launching parallel research for ${plan.subClaims.length} sub-claims...`);
 
-    const tasks = plan.subClaims.map(async (subClaim) => {
-      updateStatus(subClaim.id, { state: 'running' });
+    let pendingSubClaims = [...plan.subClaims];
+    let wave = 0;
 
-      // Launch web and wiki research in parallel
-      const [webResult, wikiResult] = await Promise.allSettled([
-        researchSubClaimWeb(subClaim, apiConfig, braveApiKey, braveProxyUrl, {
-          onReasoningChunk: (chunk) => {
-            callbacks?.onReasoningChunk?.(chunk);
-          },
-        }),
-        researchSubClaimWiki(subClaim, apiConfig, wikiId, {
-          onReasoningChunk: (chunk) => {
-            callbacks?.onReasoningChunk?.(chunk);
-          },
-        }),
-      ]);
-
-      let webFindings: EvidenceFinding[] = [];
-      let wikiFindings: EvidenceFinding[] = [];
-      let error: string | undefined;
-
-      if (webResult.status === 'fulfilled') {
-        if (webResult.value.success) {
-          webFindings = webResult.value.findings;
-        } else {
-          error = webResult.value.error;
-        }
-      } else {
-        error = webResult.reason instanceof Error ? webResult.reason.message : String(webResult.reason);
+    while (pendingSubClaims.length > 0 && wave <= MAX_STALL_WAVES) {
+      if (wave > 0) {
+        callbacks?.onReasoningChunk?.(`[ResearchLoop] Retry wave ${wave} for ${pendingSubClaims.length} stalled sub-claim(s)...`);
       }
 
-      if (wikiResult.status === 'fulfilled') {
-        if (wikiResult.value.success) {
-          wikiFindings = wikiResult.value.findings;
-        } else if (!error) {
-          error = wikiResult.value.error;
-        }
-      } else {
-        if (!error) {
-          error = wikiResult.reason instanceof Error ? wikiResult.reason.message : String(wikiResult.reason);
+      const results = await Promise.allSettled(pendingSubClaims.map((sc) => runSubClaim(sc)));
+
+      const stalled: typeof plan.subClaims = [];
+      for (let i = 0; i < pendingSubClaims.length; i++) {
+        const result = results[i];
+        const subClaim = pendingSubClaims[i];
+        if (result.status === 'rejected') {
+          const err = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          if (isRetryableError(err)) {
+            stalled.push(subClaim);
+            updateStatus(subClaim.id, { state: 'stalled', error: err });
+          } else {
+            updateStatus(subClaim.id, { state: 'failed', error: err });
+          }
+        } else if (!result.value.completed) {
+          stalled.push(subClaim);
         }
       }
 
-      externalFindings.push(...webFindings);
-      internalFindings.push(...wikiFindings);
+      pendingSubClaims = stalled;
+      wave++;
+    }
 
-      updateStatus(subClaim.id, {
-        state: error && webFindings.length === 0 && wikiFindings.length === 0 ? 'failed' : 'completed',
-        webFindingsCount: webFindings.length,
-        wikiFindingsCount: wikiFindings.length,
-        error,
+    // Mark remaining stalled as failed after max waves
+    for (const sc of pendingSubClaims) {
+      const status = taskStatuses.find((t) => t.subClaimId === sc.id);
+      updateStatus(sc.id, {
+        state: 'failed',
+        error: status?.error || 'Max retry waves exceeded',
       });
-    });
+    }
 
-    await Promise.all(tasks);
+    // Flatten findings
+    for (const findings of subClaimFindings.values()) {
+      externalFindings.push(...findings.external);
+      internalFindings.push(...findings.internal);
+    }
 
     // Persist evidence
     await saveExternalEvidence(plan.tipId, externalFindings);
@@ -139,4 +199,65 @@ export async function runParallelResearch(
       error,
     };
   }
+}
+
+/**
+ * AgentFn implementation of the parallel research loop.
+ * Receives a ResearchPlan JSON via `ctx.currentDraft`.
+ */
+export async function researchLoopAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  checkAborted(ctx);
+  const plan: ResearchPlan = JSON.parse(ctx.currentDraft);
+  const apiConfig = ctx.apiConfig;
+  const braveApiKey = ctx.braveApiKey;
+  const braveProxyUrl = ctx.braveProxyUrl;
+  const wikiId = ctx.wikiId ?? null;
+
+  emitReasoning(
+    `[ResearchLoop] Launching parallel research for ${plan.subClaims.length} sub-claims...`,
+    onReasoningChunk,
+    onUpdate
+  );
+
+  const result = await runParallelResearch(
+    plan,
+    apiConfig,
+    braveApiKey,
+    braveProxyUrl,
+    wikiId,
+    {
+      onReasoningChunk: (chunk) => emitReasoning(chunk, onReasoningChunk, onUpdate),
+      onTaskUpdate: (status) => {
+        emitReasoning(
+          `[ResearchLoop] ${status.subClaimQuestion}: ${status.state} (web=${status.webFindingsCount}, wiki=${status.wikiFindingsCount})`,
+          onReasoningChunk,
+          onUpdate
+        );
+      },
+    }
+  );
+
+  if (!result.success) {
+    throw new Error(result.error || 'Research loop failed');
+  }
+
+  const allFindings = [...result.externalFindings, ...result.internalFindings];
+
+  return buildAgentOutput({
+    draft: JSON.stringify({
+      externalFindings: result.externalFindings,
+      internalFindings: result.internalFindings,
+    }),
+    reasoning: `Researched ${plan.subClaims.length} sub-claims. ${result.externalFindings.length} web findings, ${result.internalFindings.length} wiki findings.`,
+    metadata: {
+      findings: allFindings,
+      externalFindings: result.externalFindings,
+      internalFindings: result.internalFindings,
+      taskStatuses: result.taskStatuses,
+    },
+  });
 }

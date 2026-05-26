@@ -1,5 +1,4 @@
 import type { SessionConfig } from './sessionConfig';
-import type { SegmentId } from './fileManager';
 
 export type StageId =
   | 'articleResearch'
@@ -10,7 +9,17 @@ export type StageId =
   | 'segmentEditor'
   | 'assembler'
   | 'agent6'
-  | 'topicLoop';
+  | 'topicLoop'
+  // Workbench stages
+  | 'decompose'
+  | 'research'
+  | 'synthesize'
+  | 'audit'
+  | 'rewrite'
+  | 'assemble'
+  | 'ingest'
+  | 'query'
+  | 'lint';
 
 export type StageStatus = 'pending' | 'running' | 'completed' | 'rejected' | 'error';
 
@@ -62,7 +71,7 @@ export type TopicState =
 
 export interface TopicStatus {
   index: number;
-  segmentId: SegmentId;
+  segmentId: string;
   label: string;
   state: TopicState;
   attempt: number;

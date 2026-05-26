@@ -1,4 +1,7 @@
 import type { Synthesis, EvidenceAudit } from '../types';
+import type { AgentOutput, StageRecord } from '../lib/pipelineTypes';
+import type { WorkbenchAgentContext } from '../lib/workbenchAgentContext';
+import { emitReasoning, buildAgentOutput } from '../lib/workbenchAgentContext';
 
 export interface MechanicalValidationResult {
   passed: boolean;
@@ -66,4 +69,34 @@ export function buildMechanicalAudit(validation: MechanicalValidationResult): Ev
       ? undefined
       : `Mechanical validation failed:\n- ${validation.issues.join('\n- ')}\n\nPlease add missing sources or diversify references.`,
   };
+}
+
+/**
+ * AgentFn implementation of mechanical validation.
+ * Receives synthesis JSON via `ctx.currentDraft`.
+ * Returns AgentOutput with validation result and audit in metadata.
+ */
+export async function validateMechanicallyAgent(
+  ctx: WorkbenchAgentContext,
+  onReasoningChunk: (chunk: string) => void,
+  onUpdate?: (partial: Partial<StageRecord>) => void
+): Promise<AgentOutput> {
+  const synthesis: Synthesis = JSON.parse(ctx.currentDraft);
+
+  emitReasoning('[MechanicalValidator] Running fast code-level validation...', onReasoningChunk, onUpdate);
+
+  const validation = validateMechanically(synthesis);
+  const audit = buildMechanicalAudit(validation);
+
+  emitReasoning(
+    `[MechanicalValidator] ${validation.passed ? 'PASSED' : 'FAILED'} — ${validation.issues.length} issue(s).`,
+    onReasoningChunk,
+    onUpdate
+  );
+
+  return buildAgentOutput({
+    draft: JSON.stringify(validation),
+    reasoning: `Mechanical validation ${validation.passed ? 'passed' : 'failed'} with ${validation.issues.length} issue(s)`,
+    metadata: { validation, audit },
+  });
 }

@@ -1,43 +1,12 @@
 import { PipelineRunner } from '../workbench/lib/pipeline';
 import type { AgentMap } from '../workbench/lib/pipelineTypes';
-import { buildSessionConfig } from '../workbench/lib/sessionConfig';
-import { writeSegment } from '../workbench/lib/fileManager';
-import type { Country, Continent, Voice, Topic, BiasPosition } from '../workbench/types-shared';
+import { dbSet, dbGet } from '../workbench/lib/fileManager';
+import type { SessionConfig } from '../workbench/lib/sessionConfig';
 
 export interface HelloWorldResult {
   success: boolean;
   message: string;
 }
-
-const dummyCountry: Country = {
-  code: 'US',
-  name: 'United States',
-  continent: 'North America',
-  continentCode: 'NA',
-  center: [37.09, -95.71],
-  zoom: 4,
-  newsSources: [{ name: 'Example News' }],
-  language: 'en',
-};
-
-const dummyContinent: Continent = {
-  code: 'NA',
-  name: 'North America',
-  bounds: [[15, -170], [72, -50]],
-  color: '#3b82f6',
-  newsSources: [{ name: 'Example Continental', language: 'en' }],
-};
-
-const dummyVoice: Voice = {
-  id: 'default',
-  voiceId: 'default',
-  label: 'Default',
-  description: 'Default voice',
-  gender: 'male',
-  accent: 'neutral',
-};
-
-const dummyTopics: Topic[] = ['General News', 'Politics', 'Economy'];
 
 const dummyAgents: AgentMap = {
   articleResearch: async (_ctx, onReasoningChunk) => {
@@ -98,11 +67,11 @@ const dummyAgents: AgentMap = {
   },
   agent6: async (_ctx, onReasoningChunk) => {
     onReasoningChunk('Finalising...');
-    // Write a file to IndexedDB via the reused file manager
-    await writeSegment('intro', 'hello-world-pipeline-test');
+    // Write a file to IndexedDB via the generic wrapper
+    await dbSet('newsroom/intro.txt', 'hello-world-pipeline-test');
     return {
       draft: 'Final content with IndexedDB write.',
-      reasoning: 'Wrote intro segment to IndexedDB.',
+      reasoning: 'Wrote intro key to IndexedDB.',
       metadata: { done: true },
     };
   },
@@ -110,15 +79,14 @@ const dummyAgents: AgentMap = {
 
 export async function runHelloWorldTest(): Promise<HelloWorldResult> {
   try {
-    const sessionConfig = buildSessionConfig({
-      country: dummyCountry,
-      continent: dummyContinent,
-      timeframe: 'daily',
-      topics: dummyTopics,
-      voice: dummyVoice,
-      bias: 'moderate' as BiasPosition,
-      includeEditorialSegment: false,
-    });
+    const sessionConfig: SessionConfig = {
+      apiConfig: {
+        provider: 'openai',
+        apiKey: 'test-key',
+        baseUrl: '',
+        model: 'gpt-4o',
+      },
+    };
 
     const runner = new PipelineRunner(dummyAgents, {
       onStateChange: () => {},
@@ -129,13 +97,12 @@ export async function runHelloWorldTest(): Promise<HelloWorldResult> {
     await runner.run(sessionConfig, true); // testMode = true
 
     // Verify the file was written by reading it back
-    const { readSegment } = await import('../workbench/lib/fileManager');
-    const content = await readSegment('intro');
+    const content = await dbGet('newsroom/intro.txt');
 
     if (content === 'hello-world-pipeline-test') {
       return {
         success: true,
-        message: 'Pipeline executed and wrote "hello-world-pipeline-test" to IndexedDB intro segment.',
+        message: 'Pipeline executed and wrote "hello-world-pipeline-test" to IndexedDB intro key.',
       };
     }
 

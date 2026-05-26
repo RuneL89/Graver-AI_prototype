@@ -1,10 +1,14 @@
-import { useState, useCallback } from 'react';
+import { useState } from 'react';
 import { ShieldCheck, Loader2, AlertCircle, AlertTriangle, Info } from 'lucide-react';
-import { lintWiki, type LintIssue } from '../../workbench/predigestor/linter';
-import type { ApiConfig } from '../../workbench/types-shared';
+import { PipelineRunner } from '../../workbench/lib/pipeline';
+import { workbenchPredigestorAgentMap } from '../../workbench/lib/workbenchAgentMap';
+import { WORKBENCH_PREDIGESTOR_STAGE_DEFS } from '../../workbench/lib/workbenchStages';
+import { createWorkbenchContextBuilder } from '../../workbench/lib/workbenchAgentContext';
+import type { WorkbenchSessionConfig } from '../../workbench/types';
+import type { LintIssue } from '../../workbench/predigestor/linter';
 
 interface WikiLintProps {
-  apiConfig: ApiConfig;
+  sessionConfig: WorkbenchSessionConfig;
   wikiId: string | null;
 }
 
@@ -22,15 +26,11 @@ const typeLabel: Record<LintIssue['type'], string> = {
   empty: 'Empty Page',
 };
 
-export default function WikiLint({ apiConfig, wikiId }: WikiLintProps) {
+export default function WikiLint({ sessionConfig, wikiId }: WikiLintProps) {
   const [issues, setIssues] = useState<LintIssue[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reasoning, setReasoning] = useState<string[]>([]);
-
-  const appendReasoning = useCallback((chunk: string) => {
-    setReasoning((prev) => [...prev, chunk]);
-  }, []);
 
   const handleLint = async () => {
     if (!wikiId) return;
@@ -40,15 +40,33 @@ export default function WikiLint({ apiConfig, wikiId }: WikiLintProps) {
     setReasoning([]);
 
     try {
-      const result = await lintWiki(apiConfig, wikiId, {
-        onReasoningChunk: appendReasoning,
-      });
+      const runner = new PipelineRunner(
+        workbenchPredigestorAgentMap as unknown as import('../../workbench/lib/pipelineTypes').AgentMap,
+        {
+          onStateChange: () => {},
+          onComplete: () => {},
+          onError: (err) => setError(err),
+        },
+        {
+          stageDefinitions: WORKBENCH_PREDIGESTOR_STAGE_DEFS,
+          initialStageId: 'lint',
+          enableTopicLoop: false,
+          contextBuilder: createWorkbenchContextBuilder(sessionConfig, wikiId),
+        }
+      );
 
-      if (!result.success) {
-        throw new Error(result.error || 'Lint failed');
+      const result = await runner.executeStage(
+        'lint',
+        sessionConfig,
+        '',
+        undefined
+      );
+
+      const meta = result.metadata as { issues?: LintIssue[] };
+      setIssues(meta?.issues ?? []);
+      if (result.reasoning) {
+        setReasoning([result.reasoning]);
       }
-
-      setIssues(result.issues);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

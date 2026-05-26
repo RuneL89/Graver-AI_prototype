@@ -1,13 +1,26 @@
+let isRunning = false;
+let currentStatus = '';
+
 export const PipelineService = {
   async start(): Promise<void> {
-    // no-op in web build
+    isRunning = true;
+    currentStatus = 'Starting...';
   },
 
-  async update(_status: string): Promise<void> {
-    // no-op in web build
+  async update(status: string): Promise<void> {
+    currentStatus = status;
   },
 
   async stop(): Promise<void> {
-    // no-op in web build
+    isRunning = false;
+    currentStatus = '';
+  },
+
+  isActive(): boolean {
+    return isRunning;
+  },
+
+  getStatus(): string {
+    return currentStatus;
   },
 };

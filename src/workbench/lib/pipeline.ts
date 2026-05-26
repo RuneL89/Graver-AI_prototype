@@ -14,73 +14,135 @@ import type {
 } from './pipelineTypes';
 import { STAGE_DEFINITIONS } from './pipelineTypes';
 import type { SessionConfig } from './sessionConfig';
-import type { SegmentId } from './fileManager';
+
 import { PipelineService } from './pipelineService';
 import { PipelineNotifications } from './pipelineNotifications';
 
 const MAX_RETRIES = 3;
 const MAX_TOPIC_ATTEMPTS = 5;
 
-const INDEX_TO_SEGMENT: SegmentId[] = [
+export type NextStageFn = (
+  current: StageId,
+  metadata: unknown,
+  draft: string,
+  state: PipelineState
+) => Promise<StageId | 'COMPLETE'> | StageId | 'COMPLETE';
+
+export type ContextBuilder<T> = (params: {
+  sessionConfig: T;
+  currentDraft: string;
+  iteration: number;
+  segmentLoopIndex: number;
+  feedback?: unknown;
+}) => AgentContext;
+
+export interface PromptLogEntry {
+  id: string;
+  timestamp: string;
+  stageId: StageId;
+  agentName: string;
+  prompt: string;
+  response: string;
+}
+
+export interface PipelineRunnerOptions<T = SessionConfig> {
+  /** Override default stage definitions. Falls back to newsroom stages if not provided. */
+  stageDefinitions?: Omit<StageRecord, 'status' | 'iteration' | 'reasoning' | 'output' | 'metadata' | 'startedAt' | 'completedAt'>[];
+  /** Override the default getNextStage logic. */
+  getNextStage?: NextStageFn;
+  /** Initial stage for run(). Defaults to 'articleResearch'. */
+  initialStageId?: StageId;
+  /** Stage order for runFromStage() reset logic. */
+  stageOrder?: StageId[];
+  /** Enable the parallel topic loop (newsroom only). */
+  enableTopicLoop?: boolean;
+  /** Custom context builder for passing extra fields to agents (e.g., workbench fields). */
+  contextBuilder?: ContextBuilder<T>;
+}
+
+const INDEX_TO_SEGMENT: string[] = [
   'article1', 'article2', 'article3', 'article4', 'article5',
   'article6', 'article7', 'article8', 'editorial',
 ];
 
 function getTopicLabel(index: number, sessionConfig: SessionConfig): string {
-  const topics = sessionConfig.content.topics;
-  const country = sessionConfig.geography.country.name;
-  const continent = sessionConfig.geography.continent.name;
+  const cfg = sessionConfig as any;
+  const topics = cfg.content?.topics as string[] | undefined;
+  const country = cfg.geography?.country as Record<string, string> | undefined;
+  const continent = cfg.geography?.continent as Record<string, string> | undefined;
   switch (index) {
-    case 0: return `${topics[0]}, ${country}`;
-    case 1: return `${topics[1]}, ${country}`;
-    case 2: return `${topics[2]}, ${country}`;
+    case 0: return `${topics?.[0] ?? ''}, ${country?.name ?? ''}`;
+    case 1: return `${topics?.[1] ?? ''}, ${country?.name ?? ''}`;
+    case 2: return `${topics?.[2] ?? ''}, ${country?.name ?? ''}`;
     case 3: return 'Wildcard Local 1';
     case 4: return 'Wildcard Local 2';
-    case 5: return `${topics[0]}, ${continent}`;
-    case 6: return `${topics[1]}, ${continent}`;
-    case 7: return `${topics[2]}, ${continent}`;
+    case 5: return `${topics?.[0] ?? ''}, ${continent?.name ?? ''}`;
+    case 6: return `${topics?.[1] ?? ''}, ${continent?.name ?? ''}`;
+    case 7: return `${topics?.[2] ?? ''}, ${continent?.name ?? ''}`;
     case 8: return 'Editorial';
     default: return `Topic ${index + 1}`;
   }
 }
 
-function createInitialStages(): StageRecord[] {
-  return STAGE_DEFINITIONS.map((def) => ({
-    ...def,
-    status: 'pending' as StageStatus,
-    iteration: 0,
-    reasoning: '',
-    output: '',
-  }));
-}
-
-function createInitialState(): PipelineState {
-  return {
-    status: 'idle',
-    currentStageId: null,
-    selectedStageId: null,
-    stages: createInitialStages(),
-    currentDraft: '',
-    finalDraft: null,
-    error: null,
-    editorLoops: 0,
-    segmentLoopIndex: -1,
-    hasRunTopicLoop: false,
-  };
-}
-
-export class PipelineRunner {
+export class PipelineRunner<T = SessionConfig> {
   private state: PipelineState;
   private callbacks: PipelineCallbacks;
   private agents: AgentMap;
-  private sessionConfig: SessionConfig | null = null;
   private abortController: AbortController | null = null;
   private testMode: boolean = false;
+  private paused: boolean = false;
+  private promptLog: PromptLogEntry[] = [];
 
-  constructor(agents: AgentMap, callbacks: PipelineCallbacks) {
+  private stageDefinitions: Omit<StageRecord, 'status' | 'iteration' | 'reasoning' | 'output' | 'metadata' | 'startedAt' | 'completedAt'>[];
+  private getNextStageFn: NextStageFn;
+  private initialStageId: StageId;
+  private stageOrder: StageId[];
+  private enableTopicLoop: boolean;
+  private contextBuilder?: ContextBuilder<T>;
+
+  constructor(
+    agents: AgentMap,
+    callbacks: PipelineCallbacks,
+    options: PipelineRunnerOptions<T> = {}
+  ) {
     this.agents = agents;
     this.callbacks = callbacks;
-    this.state = createInitialState();
+    this.stageDefinitions = options.stageDefinitions ?? STAGE_DEFINITIONS;
+    this.getNextStageFn = options.getNextStage ?? this.defaultGetNextStage.bind(this);
+    this.initialStageId = options.initialStageId ?? 'articleResearch';
+    this.stageOrder = options.stageOrder ?? [
+      'articleResearch', 'scriptWriter', 'fullScriptEditor', 'fullScriptWriter',
+      'topicLoop', 'assembler', 'agent6',
+    ];
+    this.enableTopicLoop = options.enableTopicLoop ?? true;
+    this.contextBuilder = options.contextBuilder;
+    this.state = this.createInitialState();
+  }
+
+  private createInitialStages(): StageRecord[] {
+    return this.stageDefinitions.map((def) => ({
+      ...def,
+      status: 'pending' as StageStatus,
+      iteration: 0,
+      reasoning: '',
+      output: '',
+    }));
+  }
+
+  private createInitialState(): PipelineState {
+    return {
+      status: 'idle',
+      currentStageId: null,
+      selectedStageId: null,
+      stages: this.createInitialStages(),
+      currentDraft: '',
+      finalDraft: null,
+      error: null,
+      editorLoops: 0,
+      segmentLoopIndex: -1,
+      hasRunTopicLoop: false,
+      topicLoop: undefined,
+    };
   }
 
   private topicLoopUpdateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -133,19 +195,19 @@ export class PipelineRunner {
     this.updateState({ stages });
   }
 
-  async run(sessionConfig: SessionConfig, testMode: boolean = false) {
+  async run(sessionConfig: T, testMode: boolean = false) {
     this.abortController = new AbortController();
     this.testMode = testMode;
     await PipelineNotifications.start('Starting pipeline...');
     await PipelineService.start();
     this.updateState({
-      ...createInitialState(),
+      ...this.createInitialState(),
       status: 'running',
     });
 
     try {
-      this.sessionConfig = sessionConfig;
-      let stage: StageId = 'articleResearch';
+      // sessionConfig is passed through to executeStage
+      let stage: StageId = this.initialStageId;
       let draft = '';
       let feedback: unknown = undefined;
 
@@ -175,8 +237,19 @@ export class PipelineRunner {
         // Track current draft in state after each stage
         this.updateState({ currentDraft: draft });
 
+        // Check pause flag between stages
+        if (this.paused) {
+          this.updateState({
+            status: 'idle',
+            currentStageId: stage,
+          });
+          await PipelineNotifications.stop();
+          await PipelineService.stop();
+          return;
+        }
+
         // Determine next stage
-        const next = await this.getNextStage(stage, result.metadata, draft);
+        const next = await this.getNextStageFn(stage, result.metadata, draft, this.state);
 
         if (next === 'COMPLETE' || next === null) {
           this.updateState({
@@ -208,13 +281,25 @@ export class PipelineRunner {
     PipelineService.stop();
   }
 
+  pause() {
+    this.paused = true;
+  }
+
+  resume() {
+    this.paused = false;
+  }
+
   getState(): PipelineState {
     return this.state;
   }
 
+  getPromptLog(): PromptLogEntry[] {
+    return this.promptLog;
+  }
+
   async runFromStage(
     startStageId: StageId,
-    sessionConfig: SessionConfig,
+    sessionConfig: T,
     existingState: PipelineState,
     testMode: boolean = false
   ) {
@@ -224,14 +309,10 @@ export class PipelineRunner {
     await PipelineService.start();
 
     // Determine which stages to reset based on start position
-    const stageOrder: StageId[] = [
-      'articleResearch', 'scriptWriter', 'fullScriptEditor', 'fullScriptWriter',
-      'topicLoop', 'assembler', 'agent6',
-    ];
-    const startIdx = stageOrder.indexOf(startStageId);
+    const startIdx = this.stageOrder.indexOf(startStageId);
 
     const stages = existingState.stages.map((s) => {
-      const stageIdx = stageOrder.indexOf(s.id);
+      const stageIdx = this.stageOrder.indexOf(s.id);
       if (stageIdx === -1) return s; // e.g. topicLoop is handled separately
       if (stageIdx < startIdx) return s; // Keep prior stages intact
       if (stageIdx === startIdx) {
@@ -289,7 +370,7 @@ export class PipelineRunner {
     };
 
     try {
-      this.sessionConfig = sessionConfig;
+      // sessionConfig is passed through to executeStage
       const { draft: initialDraft, feedback: initialFeedback } = this.getRunFromInputs(
         startStageId,
         stages
@@ -306,7 +387,7 @@ export class PipelineRunner {
         console.log(`[Pipeline] >>> Stage ${stage} starting — draft length: ${draft.length}`);
 
         // topicLoop is not a regular agent stage; handle it specially
-        if (stage === 'topicLoop') {
+        if (stage === 'topicLoop' && this.enableTopicLoop) {
           await this.runParallelTopicLoop(sessionConfig, draft);
           this.updateState({ hasRunTopicLoop: true });
           stage = 'assembler';
@@ -327,7 +408,18 @@ export class PipelineRunner {
         console.log(`[Pipeline] <<< Stage ${stage} completed — output draft length: ${result.draft.length}`);
         console.log(`[Pipeline] Draft preview: ${preview}`);
 
-        const next = await this.getNextStage(stage, result.metadata, draft);
+        // Check pause flag between stages
+        if (this.paused) {
+          this.updateState({
+            status: 'idle',
+            currentStageId: stage,
+          });
+          await PipelineNotifications.stop();
+          await PipelineService.stop();
+          return;
+        }
+
+        const next = await this.getNextStageFn(stage, result.metadata, draft, this.state);
 
         if (next === 'COMPLETE' || next === null) {
           this.updateState({
@@ -358,6 +450,51 @@ export class PipelineRunner {
   ): { draft: string; feedback: unknown } {
     const findStage = (id: StageId) => stages.find((s) => s.id === id);
 
+    // Workbench stages
+    switch (startStageId) {
+      case 'decompose':
+        return { draft: '', feedback: undefined };
+      case 'research': {
+        const decompose = findStage('decompose');
+        return { draft: decompose?.output ?? '', feedback: undefined };
+      }
+      case 'synthesize': {
+        const decompose = findStage('decompose');
+        try {
+          const plan = JSON.parse(decompose?.output ?? '{}');
+          return { draft: plan.tipId ?? '', feedback: undefined };
+        } catch {
+          return { draft: '', feedback: undefined };
+        }
+      }
+      case 'audit': {
+        const synthesize = findStage('synthesize');
+        return { draft: synthesize?.output ?? '', feedback: undefined };
+      }
+      case 'rewrite': {
+        const audit = findStage('audit');
+        const synthesize = findStage('synthesize');
+        return {
+          draft: synthesize?.output ?? '',
+          feedback: audit?.metadata,
+        };
+      }
+      case 'assemble': {
+        const decompose = findStage('decompose');
+        try {
+          const plan = JSON.parse(decompose?.output ?? '{}');
+          return { draft: plan.tipId ?? '', feedback: undefined };
+        } catch {
+          return { draft: '', feedback: undefined };
+        }
+      }
+      case 'ingest':
+      case 'query':
+      case 'lint':
+        return { draft: '', feedback: undefined };
+    }
+
+    // Newsroom stages
     switch (startStageId) {
       case 'articleResearch':
         return { draft: '', feedback: undefined };
@@ -366,12 +503,10 @@ export class PipelineRunner {
         return { draft: '', feedback: undefined };
 
       case 'fullScriptEditor': {
-        // Second pass if assembler has already completed
         const assembler = findStage('assembler');
         if (assembler?.status === 'completed') {
           return { draft: assembler.output, feedback: undefined };
         }
-        // First pass
         const scriptWriter = findStage('scriptWriter');
         return { draft: scriptWriter?.output ?? '', feedback: undefined };
       }
@@ -383,7 +518,6 @@ export class PipelineRunner {
 
       case 'topicLoop':
       case 'assembler': {
-        // Draft is whatever was produced before the topic loop
         const editor = findStage('fullScriptEditor');
         const writer = findStage('fullScriptWriter');
         if (editor?.status === 'completed') {
@@ -402,12 +536,12 @@ export class PipelineRunner {
     }
   }
 
-  private async executeStage(
+  async executeStage(
     stageId: StageId,
-    sessionConfig: SessionConfig,
+    sessionConfig: T,
     currentDraft: string,
     feedback: unknown
-  ) {
+  ): Promise<AgentOutput> {
     const agent = ((this.agents as unknown) as Record<string, AgentFn>)[stageId];
     if (!agent) {
       throw new Error(`No agent found for stage: ${stageId}`);
@@ -428,13 +562,21 @@ export class PipelineRunner {
     });
     this.updateState({ currentStageId: stageId });
 
-    const ctx: AgentContext = {
-      sessionConfig,
-      currentDraft,
-      iteration,
-      segmentLoopIndex: this.state.segmentLoopIndex,
-      feedback,
-    };
+    const ctx: AgentContext = this.contextBuilder
+      ? this.contextBuilder({
+          sessionConfig,
+          currentDraft,
+          iteration,
+          segmentLoopIndex: this.state.segmentLoopIndex,
+          feedback,
+        })
+      : {
+          sessionConfig: sessionConfig as unknown as SessionConfig,
+          currentDraft,
+          iteration,
+          segmentLoopIndex: this.state.segmentLoopIndex,
+          feedback,
+        };
 
     let retries = 0;
     while (true) {
@@ -469,6 +611,19 @@ export class PipelineRunner {
           metadata: result.metadata,
           completedAt: new Date().toISOString(),
         });
+
+        // Log prompt and response
+        if (result.prompt) {
+          const stageDef = this.stageDefinitions.find((d) => d.id === stageId);
+          this.promptLog.push({
+            id: `${stageId}-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            stageId,
+            agentName: stageDef?.name || stageId,
+            prompt: result.prompt,
+            response: result.draft,
+          });
+        }
 
         return result;
       } catch (err) {
@@ -511,11 +666,11 @@ export class PipelineRunner {
     return 'completed';
   }
 
-  private async getNextStage(
+  private defaultGetNextStage(
     current: StageId,
     metadata: unknown,
-    draft: string
-  ): Promise<StageId | 'COMPLETE'> {
+    _draft: string
+  ): Promise<StageId | 'COMPLETE'> | StageId | 'COMPLETE' {
     if (!metadata || typeof metadata !== 'object') {
       // Fallback: linear flow
       const flow: StageId[] = [
@@ -531,7 +686,6 @@ export class PipelineRunner {
 
     switch (current) {
       case 'articleResearch': {
-        // Always go to scriptWriter after research
         return 'scriptWriter';
       }
 
@@ -549,22 +703,21 @@ export class PipelineRunner {
           });
           return 'fullScriptWriter';
         }
-        // APPROVED: first pass → run parallel topic loop, then assembler
-        // APPROVED: second pass → done
-        if (!this.state.hasRunTopicLoop) {
-          await this.runParallelTopicLoop(this.sessionConfig!, draft);
-          this.updateState({ hasRunTopicLoop: true });
-          return 'assembler';
+        if (!this.state.hasRunTopicLoop && this.enableTopicLoop) {
+          return 'topicLoop';
         }
-        // Pass 2: done
         return 'agent6';
       }
 
       case 'fullScriptWriter':
         return 'fullScriptEditor';
 
+      case 'topicLoop': {
+        this.updateState({ hasRunTopicLoop: true });
+        return 'assembler';
+      }
+
       case 'assembler': {
-        // Flag for second fullScriptEditor pass
         this.updateState({ segmentLoopIndex: -1, hasRunTopicLoop: true });
         return 'fullScriptEditor';
       }
@@ -582,14 +735,14 @@ export class PipelineRunner {
   // ========================================================================
 
   private async runParallelTopicLoop(
-    sessionConfig: SessionConfig,
+    sessionConfig: T,
     currentDraft: string
   ): Promise<void> {
-    const totalTopics = sessionConfig.editorial.includeSegment ? 9 : 8;
+    const totalTopics = (sessionConfig as any).editorial?.includeSegment ? 9 : 8;
     const topics: TopicStatus[] = Array.from({ length: totalTopics }, (_, i) => ({
       index: i,
       segmentId: INDEX_TO_SEGMENT[i],
-      label: getTopicLabel(i, sessionConfig),
+      label: getTopicLabel(i, sessionConfig as unknown as SessionConfig),
       state: 'pending' as TopicState,
       attempt: 0,
       reasoning: '',
@@ -640,7 +793,7 @@ export class PipelineRunner {
 
   private async runTopicWorker(
     topicIndex: number,
-    sessionConfig: SessionConfig,
+    sessionConfig: T,
     currentDraft: string
   ): Promise<void> {
     while (true) {
@@ -734,20 +887,28 @@ export class PipelineRunner {
   private async executeTopicAgent(
     stageId: 'segmentEditor' | 'segmentWriter',
     topicIndex: number,
-    sessionConfig: SessionConfig,
+    sessionConfig: T,
     currentDraft: string,
     feedback?: unknown
   ): Promise<AgentOutput> {
     const agent = this.agents[stageId];
     const topic = this.state.topicLoop!.topics[topicIndex];
 
-    const ctx: AgentContext = {
-      sessionConfig,
-      currentDraft,
-      iteration: topic.attempt + 1,
-      segmentLoopIndex: topicIndex,
-      feedback,
-    };
+    const ctx: AgentContext = this.contextBuilder
+      ? this.contextBuilder({
+          sessionConfig,
+          currentDraft,
+          iteration: topic.attempt + 1,
+          segmentLoopIndex: topicIndex,
+          feedback,
+        })
+      : {
+          sessionConfig: sessionConfig as unknown as SessionConfig,
+          currentDraft,
+          iteration: topic.attempt + 1,
+          segmentLoopIndex: topicIndex,
+          feedback,
+        };
 
     let retries = 0;
     while (true) {

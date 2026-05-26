@@ -110,8 +110,8 @@ export default function Workbench({ sessionConfig }: WorkbenchProps) {
 
           <WikiSelector selectedWikiId={selectedWikiId} onSelectWiki={setSelectedWikiId} />
           <DocumentUploader sessionConfig={sessionConfig} wikiId={selectedWikiId} />
-          <WikiQuery apiConfig={sessionConfig.apiConfig} wikiId={selectedWikiId} />
-          <WikiLint apiConfig={sessionConfig.apiConfig} wikiId={selectedWikiId} />
+          <WikiQuery sessionConfig={sessionConfig} wikiId={selectedWikiId} />
+          <WikiLint sessionConfig={sessionConfig} wikiId={selectedWikiId} />
         </div>
       </div>
     </div>
