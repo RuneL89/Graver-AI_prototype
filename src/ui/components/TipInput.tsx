@@ -132,7 +132,7 @@ export default function TipInput({ sessionConfig, wikiId, onTipCreated, onStageC
 
     try {
       const runner = getOrCreateRunner();
-      await runner.run(sessionConfig);
+      await runner.run(sessionConfig, false, tipText);
 
       const finalState = runner.getState();
       const decomposeStage = finalState.stages.find((s) => s.id === 'decompose');

@@ -58,6 +58,12 @@ export interface PipelineRunnerOptions<T = SessionConfig> {
   enableTopicLoop?: boolean;
   /** Custom context builder for passing extra fields to agents (e.g., workbench fields). */
   contextBuilder?: ContextBuilder<T>;
+  /**
+   * When true, `run()` uses `getRunFromInputs()` to determine the correct draft/feedback
+   * for each next stage instead of blindly passing the previous stage's output.
+   * Required for pipelines where stages read from shared state (e.g., workbench tip router).
+   */
+  useRunFromInputs?: boolean;
 }
 
 const INDEX_TO_SEGMENT: string[] = [
@@ -99,6 +105,7 @@ export class PipelineRunner<T = SessionConfig> {
   private stageOrder: StageId[];
   private enableTopicLoop: boolean;
   private contextBuilder?: ContextBuilder<T>;
+  private useRunFromInputs: boolean;
 
   constructor(
     agents: AgentMap,
@@ -116,6 +123,7 @@ export class PipelineRunner<T = SessionConfig> {
     ];
     this.enableTopicLoop = options.enableTopicLoop ?? true;
     this.contextBuilder = options.contextBuilder;
+    this.useRunFromInputs = options.useRunFromInputs ?? false;
     this.state = this.createInitialState();
   }
 
@@ -195,7 +203,7 @@ export class PipelineRunner<T = SessionConfig> {
     this.updateState({ stages });
   }
 
-  async run(sessionConfig: T, testMode: boolean = false) {
+  async run(sessionConfig: T, testMode: boolean = false, initialDraft: string = '') {
     this.abortController = new AbortController();
     this.testMode = testMode;
     await PipelineNotifications.start('Starting pipeline...');
@@ -208,7 +216,7 @@ export class PipelineRunner<T = SessionConfig> {
     try {
       // sessionConfig is passed through to executeStage
       let stage: StageId = this.initialStageId;
-      let draft = '';
+      let draft = initialDraft;
       let feedback: unknown = undefined;
 
       while (true) {
@@ -261,6 +269,16 @@ export class PipelineRunner<T = SessionConfig> {
           await PipelineService.stop();
           this.callbacks.onComplete(draft);
           return;
+        }
+
+        // Use getRunFromInputs to determine correct inputs for the next stage
+        // when the pipeline has non-linear input requirements (e.g., workbench).
+        if (this.useRunFromInputs) {
+          const inputs = this.getRunFromInputs(next, this.state.stages);
+          if (inputs.draft !== '' || inputs.feedback !== undefined) {
+            draft = inputs.draft;
+            feedback = inputs.feedback;
+          }
         }
 
         stage = next;
